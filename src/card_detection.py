@@ -92,12 +92,11 @@ def _quad_dimensions(quad):
 
 def _group_nearby_contours(contours, pad, mask_shape):
     """
-    Group contours that are within `pad` pixels of each other, measured from
-    actual contour edges (not bounding boxes). Works correctly for tilted cards
-    whose AABBs are artificially inflated.
-
-    Implementation: fill each contour on a blank canvas, dilate by `pad` pixels,
-    then label connected components — contours in the same component are grouped.
+    Group contours whose filled shapes are within `pad` pixels of each other
+    (measured from actual contour edges, not bounding boxes).
+    Returns a list of groups; each group is a list of contour indices.
+    Used to merge the two halves of a bent card that a morphological close
+    couldn't fully bridge.
     """
     if not contours:
         return []
@@ -105,16 +104,13 @@ def _group_nearby_contours(contours, pad, mask_shape):
     drawn = np.zeros((rh, rw), dtype=np.uint8)
     for cnt in contours:
         cv2.drawContours(drawn, [cnt], -1, 255, cv2.FILLED)
-
     if pad > 0:
         k = 2 * pad + 1
         ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         dilated = cv2.dilate(drawn, ker)
     else:
         dilated = drawn
-
     _, label_map = cv2.connectedComponents(dilated)
-
     groups: dict[int, list[int]] = {}
     for i, cnt in enumerate(contours):
         pt = cnt[0][0]
@@ -208,6 +204,13 @@ def _valid_card_quad(quad, aspect=_CARD_ASPECT, tol=0.25):
     return abs(ratio - aspect) < tol * aspect
 
 
+def _expand_quad(quad, frac=0.15):
+    """Expand a quad outward from its centroid by `frac` of each side's half-length."""
+    cx, cy = quad.mean(axis=0)
+    expanded = quad + frac * (quad - np.array([cx, cy]))
+    return expanded.astype(np.float32)
+
+
 def _extract_card(region, quad):
     """
     Perspective-warp the quadrilateral to a canonical (CARD_WIDTH × CARD_HEIGHT)
@@ -217,12 +220,36 @@ def _extract_card(region, quad):
     out_w, out_h = (CARD_HEIGHT, CARD_WIDTH) if w > h else (CARD_WIDTH, CARD_HEIGHT)
     dst = np.array([[0, 0], [out_w - 1, 0],
                     [out_w - 1, out_h - 1], [0, out_h - 1]], dtype=np.float32)
+    # Expand the source quad slightly so faded edge pixels fall inside the warp.
+    # The tight-crop below then recovers the exact colored boundary.
+    expanded_quad = _expand_quad(quad, frac=0.25)
     try:
-        M = cv2.getPerspectiveTransform(quad, dst)
+        M = cv2.getPerspectiveTransform(expanded_quad, dst)
         card = cv2.warpPerspective(region, M, (out_w, out_h))
-        # Always return portrait
         if out_w > out_h:
             card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
+
+        # Tight-crop to the colored/white junction.
+        # Use a low saturation threshold (25) to catch faded card edges.
+        # Clamp to the inner 85% of the warped image to avoid including
+        # table-surface pixels pulled in by the 25% quad expansion.
+        ch, cw = card.shape[:2]
+        margin_x = int(cw * 0.075)
+        margin_y = int(ch * 0.075)
+        hsv_c = cv2.cvtColor(card, cv2.COLOR_BGR2HSV)
+        _, col_mask = cv2.threshold(hsv_c[:, :, 1], 25, 255, cv2.THRESH_BINARY)
+        col_mask[:margin_y, :] = 0
+        col_mask[ch - margin_y:, :] = 0
+        col_mask[:, :margin_x] = 0
+        col_mask[:, cw - margin_x:] = 0
+        ys, xs = np.where(col_mask > 0)
+        if len(xs) > 100:
+            x1, x2 = int(xs.min()), int(xs.max())
+            y1, y2 = int(ys.min()), int(ys.max())
+            if (x2 - x1) > 20 and (y2 - y1) > 20:
+                card = card[y1:y2 + 1, x1:x2 + 1]
+
+        card = cv2.resize(card, (CARD_WIDTH, CARD_HEIGHT))
         return card
     except cv2.error:
         return None
@@ -259,14 +286,25 @@ def _edge_density_on_quad(edges_img, quad, thickness=8):
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _fill_holes(mask: np.ndarray) -> np.ndarray:
+    """
+    Fill enclosed holes in a binary mask via flood-fill from the border.
+    Adds a 1-px zero border so the seed point is always background.
+    This merges isolated inner blobs (e.g. number inside white oval) with the
+    surrounding colored region, giving one solid blob per card.
+    """
+    padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    hp, wp = padded.shape
+    ffm = np.zeros((hp + 2, wp + 2), dtype=np.uint8)
+    temp = padded.copy()
+    cv2.floodFill(temp, ffm, (0, 0), 255)
+    holes = cv2.bitwise_not(temp)
+    return cv2.bitwise_or(padded, holes)[1:-1, 1:-1]
+
+
 def detect_cards(region: np.ndarray) -> list[np.ndarray]:
     """
     Detect and extract individual UNO cards from a region image.
-
-    Thresholds the HSV saturation channel to isolate colored card interiors,
-    then fits a minimum-area bounding rectangle to each connected region.
-    This gives accurate oriented quads regardless of card tilt, which the
-    perspective transform maps to canonical portrait images.
 
     Args:
         region: BGR image of a single player's area or the center area.
@@ -277,18 +315,11 @@ def detect_cards(region: np.ndarray) -> list[np.ndarray]:
     """
     h, w = region.shape[:2]
     min_dim = min(h, w)
-
-    # 1. Saturation mask — colored card interiors have high saturation;
-    #    white borders and white backgrounds do not.
     hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-    sat = hsv[:, :, 1]
-    blur = cv2.GaussianBlur(sat, (9, 9), 0)
-    _, mask = cv2.threshold(blur, 40, 255, cv2.THRESH_BINARY)
 
-    # 2. Per-color detection: process each UNO card color independently so
-    #    adjacent cards of different colors can never be merged by morphology.
-    #    Red wraps around hue = 0/180, so it needs two ranges.
-    sat_lo = 60      # minimum saturation to be considered a card color
+    # Per-color ranges for the 4 standard UNO card colors.
+    # Red wraps around hue=0/180, so it needs two ranges.
+    sat_lo = 60
     hue_ranges = [
         ((0,   sat_lo, 50), (10,  255, 255)),   # red (low hue)
         ((160, sat_lo, 50), (179, 255, 255)),   # red (high hue)
@@ -297,9 +328,6 @@ def detect_cards(region: np.ndarray) -> list[np.ndarray]:
         ((90,  sat_lo, 50), (130, 255, 255)),   # blue
     ]
 
-    # Large isotropic close per color: safely bridges the within-card oval gap
-    # because fragments of different cards can never be adjacent in the same
-    # single-color mask.
     ks = max(int(min_dim * 0.05) | 1, 7)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ks, ks))
     card_min_area = (min_dim * 0.15) ** 2
@@ -308,25 +336,75 @@ def detect_cards(region: np.ndarray) -> list[np.ndarray]:
     for lo, hi in hue_ranges:
         cmask = cv2.inRange(hsv, lo, hi)
         cmask = cv2.morphologyEx(cmask, cv2.MORPH_CLOSE, kernel)
+        # Fill enclosed holes: white oval ring and central number blob merge
+        # with the surrounding card body → one solid blob per card face.
+        cmask = _fill_holes(cmask)
         contours, _ = cv2.findContours(cmask, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            if cv2.contourArea(cnt) < card_min_area:
-                continue
+        big = [cnt for cnt in contours if cv2.contourArea(cnt) >= card_min_area]
+
+        # Tight tolerance for an individual blob to count as a full card.
+        # Halves of a bent card each have ratio ~1.0–1.2, well outside this.
+        TIGHT_TOL = 0.30
+
+        good, bad = [], []
+        for cnt in big:
+            hull = cv2.convexHull(cnt)
+            rect = cv2.minAreaRect(hull)
+            ww, hh = rect[1]
+            ratio = max(ww, hh) / max(min(ww, hh), 1e-6)
+            if abs(ratio - _CARD_ASPECT) < TIGHT_TOL * _CARD_ASPECT:
+                good.append(cnt)
+            else:
+                bad.append(cnt)
+
+        # Good blobs → straightforward card candidates.
+        for cnt in good:
             hull = cv2.convexHull(cnt)
             rect = cv2.minAreaRect(hull)
             box = cv2.boxPoints(rect)
             quad = _order_quad(box.astype(np.float32))
-            if not _valid_card_quad(quad, tol=0.55):
-                continue
             card_img = _extract_card(region, quad)
             if card_img is not None:
                 candidates.append((quad, card_img))
 
-    # 3. Deduplicate (red is detected twice — high/low hue ranges).
+        # Bad blobs → try all pairs; keep a pair if their merged hull IS card-shaped.
+        # This fuses the two halves of a bent card without touching well-formed cards.
+        for i in range(len(bad)):
+            for j in range(i + 1, len(bad)):
+                pts = np.concatenate([bad[i].reshape(-1, 2),
+                                      bad[j].reshape(-1, 2)])
+                hull = cv2.convexHull(pts.reshape(-1, 1, 2))
+                if cv2.contourArea(hull) < card_min_area:
+                    continue
+                rect = cv2.minAreaRect(hull)
+                box = cv2.boxPoints(rect)
+                quad = _order_quad(box.astype(np.float32))
+                if not _valid_card_quad(quad, tol=0.40):
+                    continue
+                card_img = _extract_card(region, quad)
+                if card_img is not None:
+                    candidates.append((quad, card_img))
+
+    # NMS: process largest quads first, suppress any candidate whose centre
+    # falls inside an already-kept quad's bbox OR that overlaps it (IoU > 0.3).
+    # This handles both red-duplicate and wild-card quadrant false positives.
+    candidates.sort(
+        key=lambda x: (x[0][:, 0].max() - x[0][:, 0].min()) *
+                      (x[0][:, 1].max() - x[0][:, 1].min()),
+        reverse=True,
+    )
     kept = []
     for quad, img in candidates:
-        if not any(_bbox_iou(quad, kq) > 0.3 for kq, _ in kept):
+        cx, cy = quad.mean(axis=0)
+        dominated = any(
+            _bbox_iou(quad, kq) > 0.3 or (
+                kq[:, 0].min() <= cx <= kq[:, 0].max() and
+                kq[:, 1].min() <= cy <= kq[:, 1].max()
+            )
+            for kq, _ in kept
+        )
+        if not dominated:
             kept.append((quad, img))
 
     return [img for _, img in kept]
