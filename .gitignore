@@ -1,0 +1,23 @@
+# Dataset images
+iapr-26-uno-vision-challenge/train_images/
+iapr-26-uno-vision-challenge/test_images/
+iapr-26-uno-vision-challenge/reference_images/
+
+# Model checkpoints
+src/checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.h5
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Jupyter outputs (optional: remove if you want to keep outputs)
+# *.ipynb can be kept but outputs can be stripped before commit
+
+# OS
+.DS_Store
