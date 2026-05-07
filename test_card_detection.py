@@ -13,7 +13,7 @@ import csv
 import cv2
 import matplotlib.pyplot as plt
 
-from src.card_detection import detect_cards
+from src.card_detection import detect_cards, debug_mask
 
 DATA_DIR  = "iapr-26-uno-vision-challenge/train_images"
 CSV_PATH  = "iapr-26-uno-vision-challenge/train.csv"
@@ -70,19 +70,25 @@ def _show_region(name, region, cards, gt_count):
         result = f"detected {n}"
     title = f"{LABELS[name]} — {gt_str} — {result}"
 
-    ncols = 1 + max(n, 1)
-    fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 5))
-    axes = list(axes) if ncols > 1 else [axes]
+    mask = debug_mask(region, name=name)
 
-    thumb = cv2.cvtColor(region, cv2.COLOR_BGR2RGB)
-    axes[0].imshow(thumb)
+    # region | mask | detected cards
+    ncols = 2 + max(n, 1)
+    fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 5))
+    axes = list(axes)
+
+    axes[0].imshow(cv2.cvtColor(region, cv2.COLOR_BGR2RGB))
     axes[0].set_title("region")
     axes[0].axis("off")
 
-    for i in range(1, ncols):
-        if i - 1 < n:
-            axes[i].imshow(cv2.cvtColor(cards[i - 1], cv2.COLOR_BGR2RGB))
-            axes[i].set_title(f"card {i - 1}")
+    axes[1].imshow(mask, cmap="gray")
+    axes[1].set_title("mask")
+    axes[1].axis("off")
+
+    for i in range(2, ncols):
+        if i - 2 < n:
+            axes[i].imshow(cv2.cvtColor(cards[i - 2], cv2.COLOR_BGR2RGB))
+            axes[i].set_title(f"card {i - 2}")
         else:
             axes[i].axis("off")
         axes[i].axis("off")

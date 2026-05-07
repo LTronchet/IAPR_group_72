@@ -302,6 +302,63 @@ def _fill_holes(mask: np.ndarray) -> np.ndarray:
     return cv2.bitwise_or(padded, holes)[1:-1, 1:-1]
 
 
+_HUE_RANGES = [
+    ((0,   60, 50), (10,  255, 255)),   # red (low hue)
+    ((160, 60, 50), (179, 255, 255)),   # red (high hue)
+    ((15,  60, 50), (40,  255, 255)),   # yellow
+    ((45,  60, 50), (85,  255, 255)),   # green
+    ((90,  60, 50), (130, 255, 255)),   # blue
+]
+
+
+def _color_blobs(region: np.ndarray):
+    """
+    Build per-colour binary masks and return (combined_mask, min_dim, kernel).
+    Each colour is closed separately to avoid bridging adjacent different-colour cards,
+    then OR-ed for the combined view.
+    """
+    h, w = region.shape[:2]
+    min_dim = min(h, w)
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    ks = max(int(min_dim * 0.10) | 1, 7)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ks, ks))
+    open_ks = max(int(min_dim * 0.04) | 1, 5)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_ks, open_ks))
+    combined = np.zeros((h, w), dtype=np.uint8)
+    for lo, hi in _HUE_RANGES:
+        m = cv2.inRange(hsv, lo, hi)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
+        m = _fill_holes(m)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, open_kernel)
+        combined = cv2.bitwise_or(combined, m)
+    return combined, min_dim, kernel
+
+
+def debug_mask(region: np.ndarray, name: str = "") -> np.ndarray:
+    """Return the combined per-colour mask used by detect_cards (for debugging)."""
+    combined, _, _ = _color_blobs(region)
+    total = region.shape[0] * region.shape[1]
+    print(f"[{name}] combined mask coverage: {np.count_nonzero(combined)/total:.1%}")
+    return combined
+
+
+def _hull_to_quad(hull: np.ndarray) -> np.ndarray:
+    """
+    Estimate a card quad from a convex hull using approxPolyDP.
+    Tries progressively looser epsilon until we get exactly 4 points.
+    Falls back to minAreaRect if polygon simplification never reaches 4.
+    """
+    peri = cv2.arcLength(hull, True)
+    for eps_frac in [0.02, 0.04, 0.06, 0.10, 0.15]:
+        approx = cv2.approxPolyDP(hull, eps_frac * peri, True)
+        if len(approx) == 4:
+            return _order_quad(approx.reshape(-1, 2).astype(np.float32))
+    # fallback
+    rect = cv2.minAreaRect(hull)
+    box = cv2.boxPoints(rect)
+    return _order_quad(box.astype(np.float32))
+
+
 def detect_cards(region: np.ndarray) -> list[np.ndarray]:
     """
     Detect and extract individual UNO cards from a region image.
@@ -315,37 +372,26 @@ def detect_cards(region: np.ndarray) -> list[np.ndarray]:
     """
     h, w = region.shape[:2]
     min_dim = min(h, w)
-    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-
-    # Per-color ranges for the 4 standard UNO card colors.
-    # Red wraps around hue=0/180, so it needs two ranges.
-    sat_lo = 60
-    hue_ranges = [
-        ((0,   sat_lo, 50), (10,  255, 255)),   # red (low hue)
-        ((160, sat_lo, 50), (179, 255, 255)),   # red (high hue)
-        ((15,  sat_lo, 50), (40,  255, 255)),   # yellow
-        ((45,  sat_lo, 50), (85,  255, 255)),   # green
-        ((90,  sat_lo, 50), (130, 255, 255)),   # blue
-    ]
-
-    ks = max(int(min_dim * 0.05) | 1, 7)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ks, ks))
     card_min_area = (min_dim * 0.15) ** 2
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    ks = max(int(min_dim * 0.10) | 1, 7)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ks, ks))
+    # Opening kernel: removes thin shadow protrusions connected to the card blob.
+    # Ellipse shape is isotropic so shadows in any direction are cleaned equally.
+    open_ks = max(int(min_dim * 0.04) | 1, 5)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_ks, open_ks))
 
     candidates = []
-    for lo, hi in hue_ranges:
+    TIGHT_TOL = 0.30
+
+    for lo, hi in _HUE_RANGES:
         cmask = cv2.inRange(hsv, lo, hi)
         cmask = cv2.morphologyEx(cmask, cv2.MORPH_CLOSE, kernel)
-        # Fill enclosed holes: white oval ring and central number blob merge
-        # with the surrounding card body → one solid blob per card face.
         cmask = _fill_holes(cmask)
+        cmask = cv2.morphologyEx(cmask, cv2.MORPH_OPEN, open_kernel)
         contours, _ = cv2.findContours(cmask, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
         big = [cnt for cnt in contours if cv2.contourArea(cnt) >= card_min_area]
-
-        # Tight tolerance for an individual blob to count as a full card.
-        # Halves of a bent card each have ratio ~1.0–1.2, well outside this.
-        TIGHT_TOL = 0.30
 
         good, bad = [], []
         for cnt in big:
@@ -358,18 +404,15 @@ def detect_cards(region: np.ndarray) -> list[np.ndarray]:
             else:
                 bad.append(cnt)
 
-        # Good blobs → straightforward card candidates.
+        # Good blobs → find 4 corners via approxPolyDP on convex hull.
         for cnt in good:
             hull = cv2.convexHull(cnt)
-            rect = cv2.minAreaRect(hull)
-            box = cv2.boxPoints(rect)
-            quad = _order_quad(box.astype(np.float32))
+            quad = _hull_to_quad(hull)
             card_img = _extract_card(region, quad)
             if card_img is not None:
                 candidates.append((quad, card_img))
 
-        # Bad blobs → try all pairs; keep a pair if their merged hull IS card-shaped.
-        # This fuses the two halves of a bent card without touching well-formed cards.
+        # Bad blobs → try all pairs; keep if merged hull is card-shaped.
         for i in range(len(bad)):
             for j in range(i + 1, len(bad)):
                 pts = np.concatenate([bad[i].reshape(-1, 2),
@@ -377,9 +420,7 @@ def detect_cards(region: np.ndarray) -> list[np.ndarray]:
                 hull = cv2.convexHull(pts.reshape(-1, 1, 2))
                 if cv2.contourArea(hull) < card_min_area:
                     continue
-                rect = cv2.minAreaRect(hull)
-                box = cv2.boxPoints(rect)
-                quad = _order_quad(box.astype(np.float32))
+                quad = _hull_to_quad(hull)
                 if not _valid_card_quad(quad, tol=0.40):
                     continue
                 card_img = _extract_card(region, quad)
