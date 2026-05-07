@@ -2,6 +2,7 @@
 iapr-26-uno-vision-challenge/train_images/
 iapr-26-uno-vision-challenge/test_images/
 iapr-26-uno-vision-challenge/reference_images/
+debug_output/
 
 # Model checkpoints
 src/checkpoints/
