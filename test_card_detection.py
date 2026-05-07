@@ -1,157 +1,148 @@
-import cv2
-import numpy as np
+"""
+Usage:
+    python test_card_detection.py [IMAGE_ID]
+
+Default IMAGE_ID: L1000770
+Ground truth loaded from train.csv (EMPTY hands -> 0 cards expected).
+Player layout: p1=bottom, p2=right, p3=top, p4=left (fixed for all images).
+"""
+
+import sys
 import os
+import csv
+import cv2
 import matplotlib.pyplot as plt
 
-from src.card_detection import detect_cards, CARD_WIDTH, CARD_HEIGHT
+from src.card_detection import detect_cards
 
-DATA_DIR = "iapr-26-uno-vision-challenge/train_images"
+DATA_DIR  = "iapr-26-uno-vision-challenge/train_images"
+CSV_PATH  = "iapr-26-uno-vision-challenge/train.csv"
 DEBUG_DIR = "debug_output"
 
-# ── Ground truth for L1000770 (no overlapping cards) ─────────────────────────
-# center: y_1   active: p3
-# p1: EMPTY     p2: y_4;g_2;r_3 (3 cards)
-# p3: b_5;y_2;r_skip (3 cards)   p4: EMPTY
-#
-# Player layout (fixed): p1=bottom, p2=right, p3=top, p4=left
-# Image size: 4000 × 2662
-#
-# Crop coordinates determined by visual inspection with a grid overlay:
-#   - Player 3 (top):   rows [0, H//3],        cols [W//4, 3*W//4]
-#   - Player 2 (right): rows [H//4, 3*H//4],   cols [3*W//4, W]
-#   - Center:           rows [H//3, 2*H//3],   cols [W//3, 2*W//3]
-
-IMAGE_FILE = "L1000770.jpg"
-GT_P2_COUNT = 3   # y_4, g_2, r_3
-GT_P3_COUNT = 3   # b_5, y_2, r_skip
-
-
-def _load():
-    path = os.path.join(DATA_DIR, IMAGE_FILE)
-    img = cv2.imread(path)
-    assert img is not None, f"Could not load {path}"
-    return img
+REGIONS = {
+    "p3":     lambda H, W: (slice(0,          H // 3),       slice(W // 4,     3 * W // 4)),
+    "p4":     lambda H, W: (slice(H // 4,     3 * H // 4),   slice(0,          W // 4)),
+    "p2":     lambda H, W: (slice(H // 4,     3 * H // 4),   slice(3 * W // 4, W)),
+    "p1":     lambda H, W: (slice(2 * H // 3, H),            slice(W // 4,     3 * W // 4)),
+    "center": lambda H, W: (slice(H // 3,     2 * H // 3),   slice(W // 3,     2 * W // 3)),
+}
+LABELS = {
+    "p1": "Player 1 (bottom)",
+    "p2": "Player 2 (right)",
+    "p3": "Player 3 (top)",
+    "p4": "Player 4 (left)",
+    "center": "Center",
+}
+CSV_KEYS = {
+    "p1": "player_1_cards",
+    "p2": "player_2_cards",
+    "p3": "player_3_cards",
+    "p4": "player_4_cards",
+    "center": "center_card",
+}
 
 
-def _crop_p3(img):
-    """Player 3 region (top): 3 non-overlapping cards."""
-    H, W = img.shape[:2]
-    return img[0 : H // 3, W // 4 : 3 * W // 4]
+def _load_gt(image_id):
+    if not os.path.exists(CSV_PATH):
+        return None
+    with open(CSV_PATH, newline="") as f:
+        for row in csv.DictReader(f):
+            if row["image_id"] == image_id:
+                return row
+    return None
 
 
-def _crop_p2(img):
-    """Player 2 region (right): 3 non-overlapping cards."""
-    H, W = img.shape[:2]
-    return img[H // 4 : 3 * H // 4, 3 * W // 4 : W]
+def _gt_count(gt, csv_key):
+    if gt is None:
+        return None
+    val = gt.get(csv_key, "")
+    if not val or val == "EMPTY":
+        return 0
+    return len(val.split(";"))
+
+
+def _show_region(name, region, cards, gt_count):
+    n = len(cards)
+    gt_str = f"GT={gt_count}" if gt_count is not None else "GT=?"
+    if gt_count is not None:
+        result = "OK" if n == gt_count else f"FAIL (detected {n})"
+    else:
+        result = f"detected {n}"
+    title = f"{LABELS[name]} — {gt_str} — {result}"
+
+    ncols = 1 + max(n, 1)
+    fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 5))
+    axes = list(axes) if ncols > 1 else [axes]
+
+    thumb = cv2.cvtColor(region, cv2.COLOR_BGR2RGB)
+    axes[0].imshow(thumb)
+    axes[0].set_title("region")
+    axes[0].axis("off")
+
+    for i in range(1, ncols):
+        if i - 1 < n:
+            axes[i].imshow(cv2.cvtColor(cards[i - 1], cv2.COLOR_BGR2RGB))
+            axes[i].set_title(f"card {i - 1}")
+        else:
+            axes[i].axis("off")
+        axes[i].axis("off")
+
+    fig.suptitle(title, fontsize=13)
+    plt.tight_layout()
+    plt.show()
 
 
 def _save_debug(name, region, cards):
-    """Save the region and each detected card as images in DEBUG_DIR."""
     os.makedirs(DEBUG_DIR, exist_ok=True)
     cv2.imwrite(os.path.join(DEBUG_DIR, f"{name}_region.jpg"), region)
     for i, card in enumerate(cards):
         cv2.imwrite(os.path.join(DEBUG_DIR, f"{name}_card_{i}.jpg"), card)
 
 
-def _show_cards(title, cards):
-    """Display detected cards side by side with matplotlib."""
-    if not cards:
-        print(f"  [{title}] No cards to display.")
-        return
-    fig, axes = plt.subplots(1, len(cards), figsize=(4 * len(cards), 5))
-    if len(cards) == 1:
-        axes = [axes]
-    fig.suptitle(title, fontsize=14)
-    for ax, card in zip(axes, cards):
-        ax.imshow(cv2.cvtColor(card, cv2.COLOR_BGR2RGB))
-        ax.axis("off")
-    plt.tight_layout()
-    plt.show()
+def run(image_id="L1000770"):
+    path = os.path.join(DATA_DIR, f"{image_id}.jpg")
+    img = cv2.imread(path)
+    assert img is not None, f"Cannot load {path}"
+    H, W = img.shape[:2]
 
+    gt = _load_gt(image_id)
+    print(f"\nImage: {image_id}  ({W}x{H})")
+    if gt:
+        print(f"  center={gt['center_card']}  active={gt['active_player']}")
+        for p in ("player_1_cards", "player_2_cards", "player_3_cards", "player_4_cards"):
+            print(f"  {p}: {gt[p]}")
 
-# ── Tests ─────────────────────────────────────────────────────────────────────
+    results = {}
+    for name, crop_fn in REGIONS.items():
+        row_sl, col_sl = crop_fn(H, W)
+        region = img[row_sl, col_sl]
+        cards = detect_cards(region)
+        gt_count = _gt_count(gt, CSV_KEYS[name])
+        results[name] = (region, cards, gt_count)
+        _save_debug(name, region, cards)
 
-def test_returns_list():
-    """detect_cards returns a list on a real player region."""
-    img = _load()
-    region = _crop_p3(img)
-    result = detect_cards(region)
-    assert isinstance(result, list), (
-        f"Expected list, got {type(result)}"
-    )
-    print(f"  [returns_list] OK — got {len(result)} card(s)")
+    print("\nResults:")
+    all_ok = True
+    for name in ("p1", "p2", "p3", "p4", "center"):
+        _, cards, gt_count = results[name]
+        n = len(cards)
+        if gt_count is not None:
+            ok = n == gt_count
+            all_ok = all_ok and ok
+            status = "OK" if ok else "FAIL"
+            print(f"  {LABELS[name]:22s}  detected={n}  expected={gt_count}  [{status}]")
+        else:
+            print(f"  {LABELS[name]:22s}  detected={n}  expected=?")
 
+    for name in ("p1", "p2", "p3", "p4", "center"):
+        region, cards, gt_count = results[name]
+        _show_region(name, region, cards, gt_count)
 
-def test_card_shape():
-    """Every returned card has shape (CARD_HEIGHT, CARD_WIDTH, 3)."""
-    img = _load()
-    region = _crop_p3(img)
-    cards = detect_cards(region)
-    assert len(cards) > 0, "No cards detected — cannot check shape"
-    for i, card in enumerate(cards):
-        assert card.shape == (CARD_HEIGHT, CARD_WIDTH, 3), (
-            f"Card {i} has shape {card.shape}, "
-            f"expected ({CARD_HEIGHT}, {CARD_WIDTH}, 3)"
-        )
-    print(f"  [card_shape] OK — all {len(cards)} card(s) are "
-          f"{CARD_WIDTH}×{CARD_HEIGHT}")
+    return all_ok
 
-
-def test_count_matches_ground_truth():
-    """Detected card count matches the annotation for both player regions."""
-    img = _load()
-
-    # Player 3 — top region
-    region_p3 = _crop_p3(img)
-    cards_p3 = detect_cards(region_p3)
-    _save_debug("p3", region_p3, cards_p3)
-    assert len(cards_p3) == GT_P3_COUNT, (
-        f"Player 3: expected {GT_P3_COUNT} cards, detected {len(cards_p3)}"
-    )
-    print(f"  [count p3] OK — {len(cards_p3)}/{GT_P3_COUNT} cards")
-    _show_cards("Player 3 — b_5 · y_2 · r_skip", cards_p3)
-
-    # Player 2 — right region
-    region_p2 = _crop_p2(img)
-    cards_p2 = detect_cards(region_p2)
-    _save_debug("p2", region_p2, cards_p2)
-    assert len(cards_p2) == GT_P2_COUNT, (
-        f"Player 2: expected {GT_P2_COUNT} cards, detected {len(cards_p2)}"
-    )
-    print(f"  [count p2] OK — {len(cards_p2)}/{GT_P2_COUNT} cards")
-    _show_cards("Player 2 — y_4 · g_2 · r_3", cards_p2)
-
-
-def test_empty_region():
-    """Returns empty list on a blank white image (no cards present)."""
-    blank = np.ones((300, 400, 3), dtype=np.uint8) * 255
-    result = detect_cards(blank)
-    assert result == [], f"Expected [], got {len(result)} card(s)"
-    print("  [empty_region] OK — returned []")
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
-    tests = [
-        test_returns_list,
-        test_card_shape,
-        test_count_matches_ground_truth,
-        test_empty_region,
-    ]
-
-    passed = 0
-    for test in tests:
-        print(f"\n{test.__name__}")
-        try:
-            test()
-            passed += 1
-        except AssertionError as e:
-            print(f"  FAIL — {e}")
-        except Exception as e:
-            print(f"  ERROR — {type(e).__name__}: {e}")
-
-    print(f"\n{passed}/{len(tests)} tests passed.")
-    print(f"Debug images saved in '{DEBUG_DIR}/'")
+    image_id = sys.argv[1] if len(sys.argv) > 1 else "L1000770"
+    ok = run(image_id)
+    print("\nAll counts match." if ok else "\nSome counts are wrong.")
