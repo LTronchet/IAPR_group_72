@@ -19,6 +19,10 @@ DATA_DIR  = "iapr-26-uno-vision-challenge/train_images"
 CSV_PATH  = "iapr-26-uno-vision-challenge/train.csv"
 DEBUG_DIR = "debug_output"
 
+# --- Tunable detection thresholds (change here to test) ---
+SAT_LO = 80    # HSV saturation lower bound  (raise to exclude low-sat shadows)
+VAL_LO = 120   # HSV value lower bound        (raise to exclude dark shadows)
+
 REGIONS = {
     "p3":     lambda H, W: (slice(0,          H // 3),       slice(W // 4,     3 * W // 4)),
     "p4":     lambda H, W: (slice(H // 4,     3 * H // 4),   slice(0,          W // 4)),
@@ -68,9 +72,9 @@ def _show_region(name, region, cards, gt_count):
         result = "OK" if n == gt_count else f"FAIL (detected {n})"
     else:
         result = f"detected {n}"
-    title = f"{LABELS[name]} — {gt_str} — {result}"
+    title = f"{LABELS[name]} — {gt_str} — {result}  [sat_lo={SAT_LO} val_lo={VAL_LO}]"
 
-    mask = debug_mask(region, name=name)
+    mask = debug_mask(region, name=name, sat_lo=SAT_LO, val_lo=VAL_LO)
 
     # region | mask | detected cards
     ncols = 2 + max(n, 1)
@@ -81,7 +85,7 @@ def _show_region(name, region, cards, gt_count):
     axes[0].set_title("region")
     axes[0].axis("off")
 
-    axes[1].imshow(mask, cmap="gray")
+    axes[1].imshow(cv2.cvtColor(mask, cv2.COLOR_BGR2RGB))
     axes[1].set_title("mask")
     axes[1].axis("off")
 
@@ -112,7 +116,7 @@ def run(image_id="L1000770"):
     H, W = img.shape[:2]
 
     gt = _load_gt(image_id)
-    print(f"\nImage: {image_id}  ({W}x{H})")
+    print(f"\nImage: {image_id}  ({W}x{H})  sat_lo={SAT_LO}  val_lo={VAL_LO}")
     if gt:
         print(f"  center={gt['center_card']}  active={gt['active_player']}")
         for p in ("player_1_cards", "player_2_cards", "player_3_cards", "player_4_cards"):
@@ -122,7 +126,7 @@ def run(image_id="L1000770"):
     for name, crop_fn in REGIONS.items():
         row_sl, col_sl = crop_fn(H, W)
         region = img[row_sl, col_sl]
-        cards = detect_cards(region)
+        cards = detect_cards(region, sat_lo=SAT_LO, val_lo=VAL_LO)
         gt_count = _gt_count(gt, CSV_KEYS[name])
         results[name] = (region, cards, gt_count)
         _save_debug(name, region, cards)
