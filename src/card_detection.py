@@ -16,7 +16,7 @@ _CARD_ASPECT = 87.0 / 56.0
 _RANGES = [
     ((0,   0, 0), (10,  255, 255), False, "red"),     # red-lo
     ((160, 0, 0), (179, 255, 255), False, "red"),     # red-hi
-    ((15,  0, 0), (40,  255, 255), False, "yellow"),  # yellow
+    ((22,  0, 0), (36,  255, 255), False, "yellow"),  # yellow
     ((45,  0, 0), (85,  255, 255), False, "green"),   # green
     ((90,  0, 0), (130, 255, 255), False, "blue"),    # blue
     ((0,   0, 0), (179, 100,  120), True,  "dark"),   # wild/+4 dark body
