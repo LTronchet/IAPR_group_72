@@ -166,7 +166,7 @@ def preprocess_mask(region: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def get_quads(region: np.ndarray,
-              masks: list[tuple[np.ndarray, bool, str]]) -> list[tuple[np.ndarray, bool]]:
+              masks: list[tuple[np.ndarray, bool, str]]) -> list[tuple[np.ndarray, bool, str]]:
     """
     Find card quadrilaterals from pre-computed masks.
 
@@ -174,14 +174,14 @@ def get_quads(region: np.ndarray,
         masks: output of preprocess_mask — list of (mask, is_dark, color).
 
     Returns:
-        List of (quad, is_dark) where quad is a 4×2 float32 array of corners
+        List of (quad, is_dark, color) where quad is a 4×2 float32 array of corners
         and is_dark=True for wild/+4 cards.
     """
     h, w = region.shape[:2]
     card_min_area = (min(h, w) * 0.15) ** 2
     TIGHT_TOL = 0.30
 
-    candidates: list[tuple[np.ndarray, bool]] = []
+    candidates: list[tuple[np.ndarray, bool, str]] = []
     # bad blobs grouped by color label for cross-range pairing
     bad_by_color: dict[str, list[np.ndarray]] = {}
 
@@ -198,7 +198,7 @@ def get_quads(region: np.ndarray,
             ratio = max(ww, hh) / max(min(ww, hh), 1e-6)
             is_good = area >= card_min_area and abs(ratio - _CARD_ASPECT) < TIGHT_TOL * _CARD_ASPECT
             if is_good:
-                candidates.append((_order_quad(cv2.boxPoints(cv2.minAreaRect(cnt))), is_dark))
+                candidates.append((_order_quad(cv2.boxPoints(cv2.minAreaRect(cnt))), is_dark, color))
             # Dark blobs always join the pairing pool — their mask is inherently
             # fragmented (colored wedges break it) so individual detection is unreliable.
             # NMS resolves any duplicate if the single-blob and paired detections overlap.
@@ -209,7 +209,7 @@ def get_quads(region: np.ndarray,
     ref_area = float(np.median([
         cv2.minAreaRect(q.reshape(-1, 1, 2).astype(np.float32))[1][0] *
         cv2.minAreaRect(q.reshape(-1, 1, 2).astype(np.float32))[1][1]
-        for q, _ in candidates
+        for q, *_ in candidates
     ])) if candidates else None
 
     # Pair bad blobs within the same color group — cross-range pairing enabled.
@@ -240,7 +240,7 @@ def get_quads(region: np.ndarray,
         for _, indices, pts_col in valid:
             if used.intersection(indices):
                 continue
-            candidates.append((_order_quad(cv2.boxPoints(cv2.minAreaRect(pts_col))), is_dark))
+            candidates.append((_order_quad(cv2.boxPoints(cv2.minAreaRect(pts_col))), is_dark, color))
             used.update(indices)
 
     return candidates
@@ -251,22 +251,22 @@ def get_quads(region: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def get_card_images(region: np.ndarray,
-                    quads: list[tuple[np.ndarray, bool]]) -> list[np.ndarray]:
+                    quads: list[tuple[np.ndarray, bool, str]]) -> list[tuple[np.ndarray, str]]:
     """
     Warp each quad to a canonical card image, then apply NMS.
 
     Args:
         region: original BGR region.
-        quads:  output of get_quads — list of (quad, is_dark).
+        quads:  output of get_quads — list of (quad, is_dark, color).
 
     Returns:
-        List of (CARD_HEIGHT × CARD_WIDTH) BGR images.
+        List of (image, color) tuples: CARD_HEIGHT × CARD_WIDTH BGR image + detected color label.
     """
-    candidates: list[tuple[np.ndarray, np.ndarray]] = []
-    for quad, is_dark in quads:
+    candidates: list[tuple[np.ndarray, np.ndarray, str]] = []
+    for quad, is_dark, color in quads:
         img = _warp_card(region, quad, skip_tight_crop=is_dark)
         if img is not None:
-            candidates.append((quad, img))
+            candidates.append((quad, img, color))
 
     # NMS: largest first; suppress if centre inside a kept bbox or IoU > 0.3.
     candidates.sort(
@@ -274,19 +274,19 @@ def get_card_images(region: np.ndarray,
                       (x[0][:, 1].max() - x[0][:, 1].min()),
         reverse=True,
     )
-    kept: list[tuple[np.ndarray, np.ndarray]] = []
-    for quad, img in candidates:
+    kept: list[tuple[np.ndarray, np.ndarray, str]] = []
+    for quad, img, color in candidates:
         cx, cy = quad.mean(axis=0)
         if not any(
             _bbox_iou(quad, kq) > 0.3 or (
                 kq[:, 0].min() <= cx <= kq[:, 0].max() and
                 kq[:, 1].min() <= cy <= kq[:, 1].max()
             )
-            for kq, _ in kept
+            for kq, *_ in kept
         ):
-            kept.append((quad, img))
+            kept.append((quad, img, color))
 
-    return [img for _, img in kept]
+    return [(img, color) for _, img, color in kept]
 
 
 # ---------------------------------------------------------------------------
@@ -294,8 +294,12 @@ def get_card_images(region: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def detect_cards(region: np.ndarray,
-                 sat_lo: int = 60, val_lo: int = 50) -> list[np.ndarray]:
-    """Detect and extract UNO cards from a region image."""
+                 sat_lo: int = 60, val_lo: int = 50) -> list[tuple[np.ndarray, str]]:
+    """Detect and extract UNO cards from a region image.
+
+    Returns list of (image, color) where color is one of:
+    'red', 'yellow', 'green', 'blue', 'dark' (wild/+4).
+    """
     masks = preprocess_mask(region, sat_lo, val_lo)
     quads = get_quads(region, masks)
     return get_card_images(region, quads)

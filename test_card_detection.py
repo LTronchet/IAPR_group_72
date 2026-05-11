@@ -91,8 +91,9 @@ def _show_region(name, region, cards, gt_count):
 
     for i in range(2, ncols):
         if i - 2 < n:
-            axes[i].imshow(cv2.cvtColor(cards[i - 2], cv2.COLOR_BGR2RGB))
-            axes[i].set_title(f"card {i - 2}")
+            card_img, card_color = cards[i - 2]
+            axes[i].imshow(cv2.cvtColor(card_img, cv2.COLOR_BGR2RGB))
+            axes[i].set_title(f"card {i - 2} ({card_color})")
         else:
             axes[i].axis("off")
         axes[i].axis("off")
@@ -105,8 +106,8 @@ def _show_region(name, region, cards, gt_count):
 def _save_debug(name, region, cards):
     os.makedirs(DEBUG_DIR, exist_ok=True)
     cv2.imwrite(os.path.join(DEBUG_DIR, f"{name}_region.jpg"), region)
-    for i, card in enumerate(cards):
-        cv2.imwrite(os.path.join(DEBUG_DIR, f"{name}_card_{i}.jpg"), card)
+    for i, (card, color) in enumerate(cards):
+        cv2.imwrite(os.path.join(DEBUG_DIR, f"{name}_card_{i}_{color}.jpg"), card)
 
 
 def run(image_id="L1000770"):
