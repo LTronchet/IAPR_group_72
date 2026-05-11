@@ -1,0 +1,176 @@
+"""
+Usage:
+    python test_card_classification.py [IMAGE_ID]
+
+Default IMAGE_ID: L1000770
+Templates are built automatically on first run and cached in templates/.
+"""
+
+import sys
+import os
+import csv
+import cv2
+import matplotlib.pyplot as plt
+
+from src.card_detection import detect_cards, debug_mask
+from src.card_classification import classify_card, load_templates, save_templates
+from src.template_builder import build_templates
+
+DATA_DIR      = "iapr-26-uno-vision-challenge/train_images"
+CSV_PATH      = "iapr-26-uno-vision-challenge/train.csv"
+DEBUG_DIR     = "debug_output"
+TEMPLATES_DIR = "templates"
+
+SAT_LO = 80
+VAL_LO = 120
+
+REGIONS = {
+    "p3":     lambda H, W: (slice(0,          H // 3),       slice(W // 4,     3 * W // 4)),
+    "p4":     lambda H, W: (slice(H // 4,     3 * H // 4),   slice(0,          W // 4)),
+    "p2":     lambda H, W: (slice(H // 4,     3 * H // 4),   slice(3 * W // 4, W)),
+    "p1":     lambda H, W: (slice(2 * H // 3, H),            slice(W // 4,     3 * W // 4)),
+    "center": lambda H, W: (slice(H // 3,     2 * H // 3),   slice(W // 3,     2 * W // 3)),
+}
+LABELS = {
+    "p1": "Player 1 (bottom)",
+    "p2": "Player 2 (right)",
+    "p3": "Player 3 (top)",
+    "p4": "Player 4 (left)",
+    "center": "Center",
+}
+CSV_KEYS = {
+    "p1": "player_1_cards",
+    "p2": "player_2_cards",
+    "p3": "player_3_cards",
+    "p4": "player_4_cards",
+    "center": "center_card",
+}
+
+
+def _load_gt(image_id):
+    if not os.path.exists(CSV_PATH):
+        return None
+    with open(CSV_PATH, newline="") as f:
+        for row in csv.DictReader(f):
+            if row["image_id"] == image_id:
+                return row
+    return None
+
+
+def _gt_count(gt, csv_key):
+    if gt is None:
+        return None
+    val = gt.get(csv_key, "")
+    if not val or val == "EMPTY":
+        return 0
+    return len(val.split(";"))
+
+
+def _get_templates():
+    if os.path.isdir(TEMPLATES_DIR) and os.listdir(TEMPLATES_DIR):
+        templates = load_templates(TEMPLATES_DIR)
+        print(f"Templates loaded from {TEMPLATES_DIR!r}: {sorted(templates.keys())}")
+    else:
+        print("Building templates from training data (first run only)...")
+        templates = build_templates(CSV_PATH, DATA_DIR, sat_lo=SAT_LO, val_lo=VAL_LO)
+        save_templates(templates, TEMPLATES_DIR)
+    return templates
+
+
+def _show_region(name, region, cards, gt_count, templates):
+    n = len(cards)
+    gt_str = f"GT={gt_count}" if gt_count is not None else "GT=?"
+    if gt_count is not None:
+        result = "OK" if n == gt_count else f"FAIL (detected {n})"
+    else:
+        result = f"detected {n}"
+    title = f"{LABELS[name]} — {gt_str} — {result}  [sat_lo={SAT_LO} val_lo={VAL_LO}]"
+
+    mask = debug_mask(region, name=name, sat_lo=SAT_LO, val_lo=VAL_LO)
+
+    ncols = 2 + max(n, 1)
+    fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 5))
+    axes = list(axes)
+
+    axes[0].imshow(cv2.cvtColor(region, cv2.COLOR_BGR2RGB))
+    axes[0].set_title("region")
+    axes[0].axis("off")
+
+    axes[1].imshow(cv2.cvtColor(mask, cv2.COLOR_BGR2RGB))
+    axes[1].set_title("mask")
+    axes[1].axis("off")
+
+    for i in range(2, ncols):
+        if i - 2 < n:
+            card_img, card_color = cards[i - 2]
+            full_label = classify_card(card_img, card_color, templates)
+            axes[i].imshow(cv2.cvtColor(card_img, cv2.COLOR_BGR2RGB))
+            axes[i].set_title(f"card {i - 2} {full_label}")
+        else:
+            axes[i].axis("off")
+        axes[i].axis("off")
+
+    fig.suptitle(title, fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+
+def _save_debug(name, region, cards, templates):
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    cv2.imwrite(os.path.join(DEBUG_DIR, f"{name}_region.jpg"), region)
+    for i, (card, color) in enumerate(cards):
+        full_label = classify_card(card, color, templates)
+        cv2.imwrite(os.path.join(DEBUG_DIR, f"{name}_card_{i}_{full_label}.jpg"), card)
+
+
+def run(image_id="L1000770"):
+    path = os.path.join(DATA_DIR, f"{image_id}.jpg")
+    img = cv2.imread(path)
+    assert img is not None, f"Cannot load {path}"
+    H, W = img.shape[:2]
+
+    templates = _get_templates()
+
+    gt = _load_gt(image_id)
+    print(f"\nImage: {image_id}  ({W}x{H})  sat_lo={SAT_LO}  val_lo={VAL_LO}")
+    if gt:
+        print(f"  center={gt['center_card']}  active={gt['active_player']}")
+        for p in ("player_1_cards", "player_2_cards", "player_3_cards", "player_4_cards"):
+            print(f"  {p}: {gt[p]}")
+
+    results = {}
+    for name, crop_fn in REGIONS.items():
+        row_sl, col_sl = crop_fn(H, W)
+        region = img[row_sl, col_sl]
+        cards = detect_cards(region, sat_lo=SAT_LO, val_lo=VAL_LO)
+        gt_count = _gt_count(gt, CSV_KEYS[name])
+        results[name] = (region, cards, gt_count)
+        _save_debug(name, region, cards, templates)
+
+    print("\nResults:")
+    all_ok = True
+    for name in ("p1", "p2", "p3", "p4", "center"):
+        _, cards, gt_count = results[name]
+        n = len(cards)
+        labels = [classify_card(c, col, templates) for c, col in cards]
+        gt_val = gt.get(CSV_KEYS[name], "?") if gt else "?"
+        if gt_count is not None:
+            ok = n == gt_count
+            all_ok = all_ok and ok
+            status = "OK" if ok else "FAIL"
+            print(f"  {LABELS[name]:22s}  detected={labels}  GT={gt_val}  [{status}]")
+        else:
+            print(f"  {LABELS[name]:22s}  detected={labels}  GT=?")
+
+    for name in ("p1", "p2", "p3", "p4", "center"):
+        region, cards, gt_count = results[name]
+        _show_region(name, region, cards, gt_count, templates)
+
+    return all_ok
+
+
+if __name__ == "__main__":
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    image_id = sys.argv[1] if len(sys.argv) > 1 else "L1000770"
+    ok = run(image_id)
+    print("\nAll counts match." if ok else "\nSome counts are wrong.")
