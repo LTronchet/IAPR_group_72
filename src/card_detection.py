@@ -9,6 +9,10 @@ CARD_WIDTH = 140
 CARD_HEIGHT = 218
 _CARD_ASPECT = 87.0 / 56.0
 
+# Expected card area in the region image, in pixels.
+# Tune this constant if cards are consistently over- or under-filtered.
+_CARD_REF_AREA_PX = 140_000
+
 # (lo_hsv, hi_hsv, is_dark, color)
 # For colored ranges (is_dark=False), sat/val in lo are overridden at runtime
 # by sat_lo/val_lo. For the dark range (is_dark=True), bounds are fixed.
@@ -143,20 +147,24 @@ def preprocess_mask(region: np.ndarray,
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, close_k)
         closed.append((m, is_dark, color))
 
-    # Build colored_union from closed colored masks so wedge edges are solid.
-    colored_union = np.zeros((h, w), dtype=np.uint8)
-    for m, is_dark, _ in closed:
-        if not is_dark:
-            colored_union = cv2.bitwise_or(colored_union, m)
+    # Pass 2 — fill holes, then subtract dark from colored to suppress wedge blobs.
+    filled = [(is_dark, color, _fill_holes(m)) for m, is_dark, color in closed]
 
-    # adj_ks = max(int(min_dim * 0.02) | 1, 3)
-    # adj_k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (adj_ks, adj_ks))
+    # Union of filled dark masks covers the full body of wild/+4 cards,
+    # including the colored center wedges that sit inside the dark border.
+    dark_filled = np.zeros((h, w), dtype=np.uint8)
+    for is_dark, _, fm in filled:
+        if is_dark:
+            dark_filled = cv2.bitwise_or(dark_filled, fm)
 
-    # Pass 2 — fill holes.
+    # Remove pixels inside dark cards from colored masks so their center
+    # wedges are not mistaken for fragments of colored cards.
     masks = []
-    for m, is_dark, color in closed:
-        m = _fill_holes(m)
-        masks.append((m, is_dark, color))
+    for is_dark, color, fm in filled:
+        if is_dark:
+            masks.append((fm, is_dark, color))
+        else:
+            masks.append((cv2.bitwise_and(fm, cv2.bitwise_not(dark_filled)), is_dark, color))
 
     return masks
 
@@ -398,6 +406,13 @@ def get_quads(region: np.ndarray,
 
     frag_min_area = card_min_area / 4  # fragments can be 1/4 of a full card
 
+    # Merge same-color masks (red-lo + red-hi → one blob per red card).
+    merged_masks: dict[tuple[bool, str], np.ndarray] = {}
+    for m, is_dark, color in masks:
+        key = (is_dark, color)
+        merged_masks[key] = cv2.bitwise_or(merged_masks[key], m) if key in merged_masks else m.copy()
+    masks = [(m, is_dark, color) for (is_dark, color), m in merged_masks.items()]
+
     for mask, is_dark, color in masks:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         # Full-size threshold for direct detection; fragment threshold for pairing pool.
@@ -408,11 +423,9 @@ def get_quads(region: np.ndarray,
             ww, hh = cv2.minAreaRect(cnt)[1]
             ratio = max(ww, hh) / max(min(ww, hh), 1e-6)
             is_good = area >= card_min_area and abs(ratio - _CARD_ASPECT) < TIGHT_TOL * _CARD_ASPECT
-            if is_good:
+            if is_good and not is_dark:
                 candidates.append((_order_quad(cv2.boxPoints(cv2.minAreaRect(cnt))), is_dark, color, "M1"))
-            # Dark blobs always join the pairing pool — their mask is inherently
-            # fragmented (colored wedges break it) so individual detection is unreliable.
-            # NMS resolves any duplicate if the single-blob and paired detections overlap.
+            # Dark blobs always join the pairing pool — requires ≥2 blobs to be detected.
             if not is_good or is_dark:
                 bad_by_color.setdefault(color, []).append(cnt)
 
@@ -482,7 +495,8 @@ def get_quads(region: np.ndarray,
             # cross-card combinations (2 blobs from 2 cards → ~50% coverage).
             # Dark cards can split into many fragments so allow larger subsets.
             max_r = len(orphans) if is_dark else min(len(orphans), 3)
-            for r in range(max_r, 0, -1):
+            min_r = 2 if is_dark else 1  # dark cards require ≥2 blobs
+            for r in range(max_r, min_r - 1, -1):
                 for sub_idxs in itertools.combinations(range(len(orphans)), r):
                     sub_cnts = [orphans[i] for i in sub_idxs]
                     for quad in _quads_from_contours(sub_cnts, ref_w, w, h):
@@ -510,7 +524,9 @@ def get_card_images(region: np.ndarray,
                     quads: list[tuple],
                     combined_mask: np.ndarray | None = None,
                     iou_thresh: float = 0.40,
-                    min_coverage: float = 0.15) -> list[tuple[np.ndarray, str]]:
+                    min_coverage: float = 0.10,
+                    size_tol: float = 0.50,
+                    ref_area: float = 0.0) -> list[tuple[np.ndarray, str]]:
     """
     Warp each quad to a canonical card image, then apply NMS.
 
@@ -520,30 +536,56 @@ def get_card_images(region: np.ndarray,
     If combined_mask (union of all color masks) is provided, quads whose
     interior is less than min_coverage covered by detected pixels are dropped
     before NMS — this rejects reconstructed quads that fall mostly on background.
+
+    ref_area: expected card area in pixels, derived from region dimensions.
+    Quads whose area deviates more than size_tol from ref_area are dropped.
+    Dark cards use 2× the tolerance — fragmented blobs make area estimates noisier.
     """
-    candidates: list[tuple[np.ndarray, np.ndarray, str]] = []
-    for quad, is_dark, color, *_ in quads:
-        if combined_mask is not None and _quad_coverage(quad, combined_mask) < min_coverage:
+    candidates: list[tuple[np.ndarray, np.ndarray, str, str]] = []
+    for quad, is_dark, color, *rest in quads:
+        method = rest[0] if rest else "?"
+        # Dark cards: skip coverage filter — sparse mask (white border, empty center)
+        # means legitimate dark quads would be incorrectly rejected.
+        if not is_dark and combined_mask is not None and _quad_coverage(quad, combined_mask) < min_coverage:
             continue
         img = _warp_card(region, quad, skip_tight_crop=is_dark)
         if img is not None:
-            candidates.append((quad, img, color))
+            candidates.append((quad, img, color, method))
+
+    # Size consistency filter anchored on ref_area (from region dimensions).
+    # Dark cards use 2× tolerance — fragmented blobs make area estimates noisier.
+    if ref_area > 0 and len(candidates) >= 2:
+        def _area(q): return _quad_dimensions(q)[0] * _quad_dimensions(q)[1]
+        for c in candidates:
+            a = _area(c[0])
+            dev = abs(a - ref_area) / ref_area
+            kept_by_size = dev <= (size_tol * 2 if c[2] == "dark" else size_tol)
+            print(f"  [size] {c[2]:6s} {c[3]:3s} area={a:.0f}  dev={dev:.2f}  {'KEEP' if kept_by_size else 'DROP'}")
+        candidates = [
+            c for c in candidates
+            if abs(_area(c[0]) - ref_area) / ref_area <= (size_tol * 2 if c[2] == "dark" else size_tol)
+        ]
 
     candidates.sort(
         key=lambda x: (x[0][:, 0].max() - x[0][:, 0].min()) *
                       (x[0][:, 1].max() - x[0][:, 1].min()),
         reverse=True,
     )
-    kept: list[tuple[np.ndarray, np.ndarray, str]] = []
-    for quad, img, color in candidates:
-        # Only suppress duplicates of the same color — different-color quads
-        # can legitimately overlap (different physical cards).
-        if not any(_bbox_iou(quad, kq) > iou_thresh
-                   for kq, _, kcolor in kept if kcolor == color):
-            kept.append((quad, img, color))
+    kept: list[tuple[np.ndarray, np.ndarray, str, str]] = []
+    for quad, img, color, method in candidates:
+        # Same-color dedup.
+        if any(_bbox_iou(quad, kq) > iou_thresh
+               for kq, _, kcolor, _ in kept if kcolor == color):
+            continue
+        # Proactive: suppress any colored quad whose centroid falls inside a kept dark quad.
+        if color != "dark":
+            cx, cy = float(quad[:, 0].mean()), float(quad[:, 1].mean())
+            if any(cv2.pointPolygonTest(kq.astype(np.float32), (cx, cy), False) >= 0
+                   for kq, _, kcolor, _ in kept if kcolor == "dark"):
+                continue
+        kept.append((quad, img, color, method))
 
-
-    return [(img, color) for _, img, color in kept]
+    return [(img, color) for _, img, color, _ in kept]
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +605,8 @@ def detect_cards(region: np.ndarray,
         combined = cv2.bitwise_or(combined, m)
     quads = get_quads(region, masks)
     return get_card_images(region, quads, combined_mask=combined,
-                           iou_thresh=0.50, min_coverage=0.60)
+                           iou_thresh=0.50, min_coverage=0.60,
+                           ref_area=_CARD_REF_AREA_PX)
 
 
 _RANGE_COLORS_BGR = [
@@ -615,6 +658,13 @@ def debug_orphan_angles(region: np.ndarray,
     TIGHT_TOL = 0.30
 
     masks = preprocess_mask(region, sat_lo, val_lo)
+    # Merge same-color masks (mirrors get_quads).
+    merged_masks: dict[tuple[bool, str], np.ndarray] = {}
+    for m, is_dark, color in masks:
+        key = (is_dark, color)
+        merged_masks[key] = cv2.bitwise_or(merged_masks[key], m) if key in merged_masks else m.copy()
+    masks = [(m, is_dark, color) for (is_dark, color), m in merged_masks.items()]
+
     vis = region.copy()
 
     # Replicate Methods 1+2 from get_quads to collect candidates / orphan state.

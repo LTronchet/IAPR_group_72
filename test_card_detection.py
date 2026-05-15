@@ -29,8 +29,7 @@ SHOW_ANGLES = False
 
 # Set True to show all quads from get_quads colour-coded by NMS outcome.
 # Green = kept, Red = suppressed (label shows IoU or center-inside reason).
-SHOW_QUADS = False
-
+SHOW_QUADS = True
 REGIONS = {
     "p3":     lambda H, W: (slice(0,          H // 3),       slice(W // 4,     3 * W // 4)),
     "p4":     lambda H, W: (slice(H // 4,     3 * H // 4),   slice(0,          W // 4)),
@@ -288,7 +287,8 @@ def run_all():
 
         status = "OK  " if img_ok else "FAIL"
         print(f"[{status}] {image_id}")
-        _show_image_summary(image_id, results)
+        if not img_ok:
+            _show_image_summary(image_id, results)
 
     print("\n--- Per-region accuracy ---")
     all_correct = sum(correct.values())
