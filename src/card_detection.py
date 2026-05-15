@@ -14,8 +14,8 @@ _CARD_ASPECT = 87.0 / 56.0
 # by sat_lo/val_lo. For the dark range (is_dark=True), bounds are fixed.
 # Two red ranges share the same color label so their fragments can be paired.
 _RANGES = [
-    ((0,   0, 0), (10,  255, 255), False, "red"),     # red-lo
-    ((160, 0, 0), (179, 255, 255), False, "red"),     # red-hi
+    ((0,   0, 0), ( 8,  255, 255), False, "red"),     # red-lo
+    ((165, 0, 0), (179, 255, 255), False, "red"),     # red-hi
     ((22,  0, 0), (36,  255, 255), False, "yellow"),  # yellow
     ((45,  0, 0), (85,  255, 255), False, "green"),   # green
     ((90,  0, 0), (130, 255, 255), False, "blue"),    # blue
@@ -165,6 +165,217 @@ def preprocess_mask(region: np.ndarray,
 # Pipeline step 2 — quad detection
 # ---------------------------------------------------------------------------
 
+def _vertex_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    """Angle in degrees at vertex b between edges b-a and b-c."""
+    v1 = a - b
+    v2 = c - b
+    cos_a = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-9)
+    return float(np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0))))
+
+
+def _valid_recon_quad(
+    quad: np.ndarray,
+    img_w: int,
+    img_h: int,
+) -> bool:
+    """Geometric sanity checks before the more expensive blob-coverage test."""
+    qw, qh = _quad_dimensions(quad)
+    if abs(max(qw, qh) / max(min(qw, qh), 1e-6) - _CARD_ASPECT) > 0.35 * _CARD_ASPECT:
+        return False
+    if not (0 <= float(quad[:, 0].mean()) <= img_w and
+            0 <= float(quad[:, 1].mean()) <= img_h):
+        return False
+    return True
+
+
+def _sample_quad_edges(quad: np.ndarray, n_per_side: int = 30) -> np.ndarray:
+    """Sample n_per_side points uniformly along each of the 4 edges of a quad."""
+    pts = []
+    for i in range(4):
+        p1 = quad[i]
+        p2 = quad[(i + 1) % 4]
+        t = np.linspace(0, 1, n_per_side, endpoint=False)
+        pts.append(p1[None] + t[:, None] * (p2 - p1)[None])
+    return np.vstack(pts)
+
+
+def _hull_corner_triples(
+    all_pts: np.ndarray, angle_tol: float = 20.0
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    Return (A, B, C) triplets of consecutive hull vertices where the angle at B is ≈ 90°.
+    A and C are the two neighbours; u = BA and v = BC are the two visible card edges.
+    """
+    pts_int = all_pts.astype(np.int32).reshape(-1, 1, 2)
+    hull = cv2.convexHull(pts_int)
+    peri = cv2.arcLength(hull, True)
+    poly = cv2.approxPolyDP(hull, max(2.0, 0.015 * peri), True).reshape(-1, 2).astype(float)
+    n = len(poly)
+    triples = []
+    for j in range(n):
+        A, B, C = poly[(j - 1) % n], poly[j], poly[(j + 1) % n]
+        if abs(_vertex_angle(A, B, C) - 90.0) < angle_tol:
+            triples.append((A, B, C))
+    return triples
+
+
+def _confirm_orientation(
+    all_pts: np.ndarray,
+    B: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    card_w: float,
+    card_h: float,
+    angle_tol: float = 20.0,
+    dist_tol: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Scan hull edges for a 3rd side that confirms which direction is width vs height.
+
+    If an edge parallel to u is found at distance ≈ card_h from B (along v),
+    then v is the height direction → (width_dir=u, height_dir=v).
+    If at distance ≈ card_w, then v is the width direction → (width_dir=v, height_dir=u).
+    Symmetric logic for edges parallel to v.
+
+    Returns (width_dir, height_dir) or None if no confirming edge is found.
+    """
+    pts_int = all_pts.astype(np.int32).reshape(-1, 1, 2)
+    hull = cv2.convexHull(pts_int)
+    peri = cv2.arcLength(hull, True)
+    poly = cv2.approxPolyDP(hull, max(2.0, 0.015 * peri), True).reshape(-1, 2).astype(float)
+    n = len(poly)
+
+    for j in range(n):
+        P, Q = poly[j], poly[(j + 1) % n]
+        edge = Q - P
+        elen = float(np.linalg.norm(edge))
+        if elen < 5.0:
+            continue
+        edir = edge / elen
+
+        cos_u = float(abs(np.dot(edir, u)))
+        cos_v = float(abs(np.dot(edir, v)))
+
+        if np.degrees(np.arccos(np.clip(cos_u, 0.0, 1.0))) < angle_tol:
+            # Edge ≈ parallel to u → opposite side; distance along v = card height
+            d = float(abs(np.dot(P - B, v)))
+            if abs(d - card_h) < dist_tol * card_h:
+                return u, v   # u=width, v=height
+            if abs(d - card_w) < dist_tol * card_w:
+                return v, u   # v=width, u=height
+
+        if np.degrees(np.arccos(np.clip(cos_v, 0.0, 1.0))) < angle_tol:
+            # Edge ≈ parallel to v → opposite side; distance along u = card width
+            d = float(abs(np.dot(P - B, u)))
+            if abs(d - card_w) < dist_tol * card_w:
+                return u, v   # u=width, v=height
+            if abs(d - card_h) < dist_tol * card_h:
+                return v, u   # v=width, u=height
+
+    return None
+
+
+def _quads_from_contours(
+    cnts: list[np.ndarray],
+    ref_w: float,
+    img_w: int,
+    img_h: int,
+    min_blob_frac: float = 0.90,
+) -> list[np.ndarray]:
+    """
+    Fit a fixed-size card rectangle to the blob using hull corner triples.
+
+    For each hull vertex B with angle ≈ 90°:
+    1. Derive orientation directly from the two adjacent edges BA and BC (no grid-search).
+    2. Place a card of fixed size ref_w × (ref_w * _CARD_ASPECT) with corner at B.
+    3. Keep placements where ≥ min_blob_frac of the blob is inside the card.
+    4. Score by best-fitting single edge (min per-edge mean distance to blob edge).
+    Returns candidates sorted by best edge alignment, deduped by IoU > 0.5.
+    """
+    if not cnts:
+        return []
+
+    all_pts = np.concatenate([c.reshape(-1, 2) for c in cnts])
+
+    blob_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    for c in cnts:
+        cv2.fillPoly(blob_mask, [c.reshape(-1, 2).astype(np.int32)], 255)
+    blob_area = int(np.count_nonzero(blob_mask))
+    if blob_area == 0:
+        return []
+
+    k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    blob_edge = cv2.morphologyEx(blob_mask, cv2.MORPH_GRADIENT, k3)
+    dist_from_edge = cv2.distanceTransform(
+        cv2.bitwise_not(blob_edge), cv2.DIST_L2, cv2.DIST_MASK_5
+    ).astype(np.float32)
+
+    card_w = ref_w
+    card_h = ref_w * _CARD_ASPECT
+
+    candidates: list[tuple[float, np.ndarray]] = []
+
+    for A, B, C in _hull_corner_triples(all_pts):
+        ba = A - B
+        ba_len = np.linalg.norm(ba)
+        if ba_len < 1e-6:
+            continue
+        u = ba / ba_len  # unit vector along edge BA
+
+        # Exact perpendicular: pick the ±90° rotation that points toward C
+        v_cw  = np.array([ u[1], -u[0]])
+        v_ccw = np.array([-u[1],  u[0]])
+        v = v_cw if np.dot(C - B, v_cw) > 0 else v_ccw
+
+        len_u = ba_len
+        len_v = np.linalg.norm(C - B)
+
+        # Try to confirm orientation via a 3rd hull edge; fall back to edge-length heuristic.
+        confirmed = _confirm_orientation(all_pts, B, u, v, card_w, card_h)
+        if confirmed is not None:
+            width_dir, height_dir = confirmed
+            len_w, len_h = (len_u, len_v) if width_dir is u else (len_v, len_u)
+        elif len_u >= len_v:
+            width_dir, height_dir, len_w, len_h = v, u, len_v, len_u
+        else:
+            width_dir, height_dir, len_w, len_h = u, v, len_u, len_v
+
+        # Reject if visible edge is longer than the card dimension (bad triple)
+        if len_w > card_w * 1.10 or len_h > card_h * 1.10:
+            continue
+        quad = _order_quad(np.array([
+            B,
+            B + width_dir  * card_w,
+            B + width_dir  * card_w + height_dir * card_h,
+            B + height_dir * card_h,
+        ], dtype=np.float32))
+        if not _valid_recon_quad(quad, img_w, img_h):
+            continue
+
+        quad_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+        cv2.fillPoly(quad_mask, [quad.astype(np.int32)], 255)
+        overlap = int(np.count_nonzero(cv2.bitwise_and(blob_mask, quad_mask)))
+        if overlap / blob_area < min_blob_frac:
+            continue
+
+        edge_pts = _sample_quad_edges(quad, n_per_side=30)
+        xs = edge_pts[:, 0].astype(np.int32).clip(0, img_w - 1)
+        ys = edge_pts[:, 1].astype(np.int32).clip(0, img_h - 1)
+        per_edge = dist_from_edge[ys, xs].reshape(4, 30).mean(axis=1)
+        edge_score = float(per_edge.min())
+        candidates.append((edge_score, quad))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda x: x[0])
+
+    deduped: list[np.ndarray] = []
+    for _, q in candidates:
+        if not any(_bbox_iou(q, dq) > 0.5 for dq in deduped):
+            deduped.append(q)
+    return deduped
+
 def get_quads(region: np.ndarray,
               masks: list[tuple[np.ndarray, bool, str]]) -> list[tuple[np.ndarray, bool, str]]:
     """
@@ -198,7 +409,7 @@ def get_quads(region: np.ndarray,
             ratio = max(ww, hh) / max(min(ww, hh), 1e-6)
             is_good = area >= card_min_area and abs(ratio - _CARD_ASPECT) < TIGHT_TOL * _CARD_ASPECT
             if is_good:
-                candidates.append((_order_quad(cv2.boxPoints(cv2.minAreaRect(cnt))), is_dark, color))
+                candidates.append((_order_quad(cv2.boxPoints(cv2.minAreaRect(cnt))), is_dark, color, "M1"))
             # Dark blobs always join the pairing pool — their mask is inherently
             # fragmented (colored wedges break it) so individual detection is unreliable.
             # NMS resolves any duplicate if the single-blob and paired detections overlap.
@@ -212,10 +423,11 @@ def get_quads(region: np.ndarray,
         for q, *_ in candidates
     ])) if candidates else None
 
-    # Pair bad blobs within the same color group — cross-range pairing enabled.
+    # Method 2 — pair bad blobs within the same color group.
     # Dark: try all subset sizes (card can split into 3+ fragments).
     # Colored: pairs only (larger combos risk false cross-card merges).
     # Greedy selection: closest area to good candidates first; each fragment used at most once.
+    used_per_color: dict[str, set[int]] = {}
     for color, bad in bad_by_color.items():
         is_dark = color == "dark"
         sizes = range(2, len(bad) + 1) if is_dark else [2]
@@ -240,8 +452,41 @@ def get_quads(region: np.ndarray,
         for _, indices, pts_col in valid:
             if used.intersection(indices):
                 continue
-            candidates.append((_order_quad(cv2.boxPoints(cv2.minAreaRect(pts_col))), is_dark, color))
+            candidates.append((_order_quad(cv2.boxPoints(cv2.minAreaRect(pts_col))), is_dark, color, "M2"))
             used.update(indices)
+        used_per_color[color] = used
+
+    # Method 3 — edge-based reconstruction for orphan blobs.
+    # Re-derive card dimensions from all candidates so far (methods 1+2).
+    # For each color, combine ALL orphan contours into one hull and also try
+    # each individually — handles cards split into multiple fragments where the
+    # combined shape still doesn't look like a full card (partial occlusion).
+    if candidates:
+        ref_area_m3 = float(np.median([
+            cv2.minAreaRect(q.reshape(-1, 1, 2).astype(np.float32))[1][0] *
+            cv2.minAreaRect(q.reshape(-1, 1, 2).astype(np.float32))[1][1]
+            for q, *_ in candidates
+        ]))
+        ref_w = float(np.sqrt(ref_area_m3 / _CARD_ASPECT))
+
+        for color, bad in bad_by_color.items():
+            is_dark = color == "dark"
+            orphan_idxs = set(range(len(bad))) - used_per_color.get(color, set())
+            orphans = [bad[i] for i in orphan_idxs
+                       if cv2.contourArea(bad[i]) >= frag_min_area]
+            if not orphans:
+                continue
+
+            # Try all subsets of orphan blobs (size 1 up to max_r).
+            # The 90% coverage check in _quads_from_contours naturally rejects
+            # cross-card combinations (2 blobs from 2 cards → ~50% coverage).
+            # Dark cards can split into many fragments so allow larger subsets.
+            max_r = len(orphans) if is_dark else min(len(orphans), 3)
+            for r in range(max_r, 0, -1):
+                for sub_idxs in itertools.combinations(range(len(orphans)), r):
+                    sub_cnts = [orphans[i] for i in sub_idxs]
+                    for quad in _quads_from_contours(sub_cnts, ref_w, w, h):
+                        candidates.append((quad, is_dark, color, "M3"))
 
     return candidates
 
@@ -250,25 +495,40 @@ def get_quads(region: np.ndarray,
 # Pipeline step 3 — card image extraction
 # ---------------------------------------------------------------------------
 
+def _quad_coverage(quad: np.ndarray, mask: np.ndarray) -> float:
+    """Fraction of the quad's interior covered by non-zero mask pixels."""
+    h, w = mask.shape[:2]
+    poly_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(poly_mask, [quad.astype(np.int32)], 255)
+    quad_area = int(np.count_nonzero(poly_mask))
+    if quad_area == 0:
+        return 0.0
+    return int(np.count_nonzero(cv2.bitwise_and(poly_mask, mask))) / quad_area
+
+
 def get_card_images(region: np.ndarray,
-                    quads: list[tuple[np.ndarray, bool, str]]) -> list[tuple[np.ndarray, str]]:
+                    quads: list[tuple],
+                    combined_mask: np.ndarray | None = None,
+                    iou_thresh: float = 0.40,
+                    min_coverage: float = 0.15) -> list[tuple[np.ndarray, str]]:
     """
     Warp each quad to a canonical card image, then apply NMS.
 
-    Args:
-        region: original BGR region.
-        quads:  output of get_quads — list of (quad, is_dark, color).
+    NMS keeps the largest quad first and suppresses any later quad whose
+    axis-aligned bounding-box IoU with a kept quad exceeds iou_thresh.
 
-    Returns:
-        List of (image, color) tuples: CARD_HEIGHT × CARD_WIDTH BGR image + detected color label.
+    If combined_mask (union of all color masks) is provided, quads whose
+    interior is less than min_coverage covered by detected pixels are dropped
+    before NMS — this rejects reconstructed quads that fall mostly on background.
     """
     candidates: list[tuple[np.ndarray, np.ndarray, str]] = []
-    for quad, is_dark, color in quads:
+    for quad, is_dark, color, *_ in quads:
+        if combined_mask is not None and _quad_coverage(quad, combined_mask) < min_coverage:
+            continue
         img = _warp_card(region, quad, skip_tight_crop=is_dark)
         if img is not None:
             candidates.append((quad, img, color))
 
-    # NMS: largest first; suppress if centre inside a kept bbox or IoU > 0.3.
     candidates.sort(
         key=lambda x: (x[0][:, 0].max() - x[0][:, 0].min()) *
                       (x[0][:, 1].max() - x[0][:, 1].min()),
@@ -276,15 +536,12 @@ def get_card_images(region: np.ndarray,
     )
     kept: list[tuple[np.ndarray, np.ndarray, str]] = []
     for quad, img, color in candidates:
-        cx, cy = quad.mean(axis=0)
-        if not any(
-            _bbox_iou(quad, kq) > 0.3 or (
-                kq[:, 0].min() <= cx <= kq[:, 0].max() and
-                kq[:, 1].min() <= cy <= kq[:, 1].max()
-            )
-            for kq, *_ in kept
-        ):
+        # Only suppress duplicates of the same color — different-color quads
+        # can legitimately overlap (different physical cards).
+        if not any(_bbox_iou(quad, kq) > iou_thresh
+                   for kq, _, kcolor in kept if kcolor == color):
             kept.append((quad, img, color))
+
 
     return [(img, color) for _, img, color in kept]
 
@@ -301,8 +558,12 @@ def detect_cards(region: np.ndarray,
     'red', 'yellow', 'green', 'blue', 'dark' (wild/+4).
     """
     masks = preprocess_mask(region, sat_lo, val_lo)
+    combined = np.zeros(region.shape[:2], dtype=np.uint8)
+    for m, *_ in masks:
+        combined = cv2.bitwise_or(combined, m)
     quads = get_quads(region, masks)
-    return get_card_images(region, quads)
+    return get_card_images(region, quads, combined_mask=combined,
+                           iou_thresh=0.50, min_coverage=0.60)
 
 
 _RANGE_COLORS_BGR = [
@@ -313,6 +574,14 @@ _RANGE_COLORS_BGR = [
     (200,  80,   0),  # blue
     ( 80,  80,  80),  # wild/+4 dark
 ]
+
+_CARD_COLOR_BGR = {
+    "red":    (  0,   0, 220),
+    "yellow": (  0, 220, 220),
+    "green":  (  0, 180,   0),
+    "blue":   (200,  80,   0),
+    "dark":   ( 80,  80,  80),
+}
 
 
 def debug_mask(region: np.ndarray, name: str = "",
@@ -327,4 +596,175 @@ def debug_mask(region: np.ndarray, name: str = "",
     total = region.shape[0] * region.shape[1]
     print(f"[{name}] sat_lo={sat_lo} val_lo={val_lo}  "
           f"coverage: {total_pixels / total:.1%}")
+    return vis
+
+
+def debug_orphan_angles(region: np.ndarray,
+                        sat_lo: int = 60, val_lo: int = 50,
+                        angle_tol: float = 40.0) -> np.ndarray:
+    """
+    Returns an annotated BGR image for Method 3 debug:
+    - Cyan outlines: quads detected by Methods 1+2
+    - Colored polygon: convex hull of orphan blobs per card color
+    - Green dot + angle: hull vertex with angle ≈ 90° (used as card corner anchor)
+    - Red dot + angle:   hull vertex outside the 90° tolerance
+    """
+    h, w = region.shape[:2]
+    card_min_area = (min(h, w) * 0.15) ** 2
+    frag_min_area = card_min_area / 4
+    TIGHT_TOL = 0.30
+
+    masks = preprocess_mask(region, sat_lo, val_lo)
+    vis = region.copy()
+
+    # Replicate Methods 1+2 from get_quads to collect candidates / orphan state.
+    candidates: list[tuple[np.ndarray, bool, str]] = []
+    bad_by_color: dict[str, list[np.ndarray]] = {}
+
+    for mask, is_dark, color in masks:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < frag_min_area:
+                continue
+            ww, hh = cv2.minAreaRect(cnt)[1]
+            ratio = max(ww, hh) / max(min(ww, hh), 1e-6)
+            is_good = (area >= card_min_area and
+                       abs(ratio - _CARD_ASPECT) < TIGHT_TOL * _CARD_ASPECT)
+            if is_good:
+                candidates.append(
+                    (_order_quad(cv2.boxPoints(cv2.minAreaRect(cnt))), is_dark, color))
+            if not is_good or is_dark:
+                bad_by_color.setdefault(color, []).append(cnt)
+
+    ref_area = float(np.median([
+        cv2.minAreaRect(q.reshape(-1, 1, 2).astype(np.float32))[1][0] *
+        cv2.minAreaRect(q.reshape(-1, 1, 2).astype(np.float32))[1][1]
+        for q, *_ in candidates
+    ])) if candidates else None
+
+    used_per_color: dict[str, set[int]] = {}
+    for color, bad in bad_by_color.items():
+        is_dark = color == "dark"
+        sizes = range(2, len(bad) + 1) if is_dark else [2]
+        valid: list[tuple[float, tuple, np.ndarray]] = []
+        for r in sizes:
+            for indices in itertools.combinations(range(len(bad)), r):
+                pts_col = np.concatenate(
+                    [bad[i].reshape(-1, 2) for i in indices]
+                ).reshape(-1, 1, 2).astype(np.float32)
+                _, (ww, hh), _ = cv2.minAreaRect(pts_col)
+                area = ww * hh
+                if area < card_min_area:
+                    continue
+                ratio = max(ww, hh) / max(min(ww, hh), 1e-6)
+                if abs(ratio - _CARD_ASPECT) < 0.40 * _CARD_ASPECT:
+                    score = abs(area - ref_area) if ref_area else area
+                    valid.append((score, indices, pts_col))
+        valid.sort(key=lambda x: x[0])
+        used: set[int] = set()
+        for _, indices, pts_col in valid:
+            if used.intersection(indices):
+                continue
+            candidates.append(
+                (_order_quad(cv2.boxPoints(cv2.minAreaRect(pts_col))), is_dark, color))
+            used.update(indices)
+        used_per_color[color] = used
+
+    # Draw Method 1+2 quads in cyan.
+    for quad, *_ in candidates:
+        cv2.polylines(vis, [quad.reshape(-1, 1, 2).astype(np.int32)], True, (255, 255, 0), 2)
+
+    # Draw orphan hull polygons with per-vertex angle annotations.
+    for color, bad in bad_by_color.items():
+        orphan_idxs = set(range(len(bad))) - used_per_color.get(color, set())
+        orphans = [bad[i] for i in orphan_idxs if cv2.contourArea(bad[i]) >= frag_min_area]
+        if not orphans:
+            continue
+
+        edge_bgr = _CARD_COLOR_BGR.get(color, (128, 128, 128))
+        all_pts = np.concatenate([c.reshape(-1, 2) for c in orphans])
+        combined = all_pts.reshape(-1, 1, 2).astype(np.int32)
+        hull = cv2.convexHull(combined)
+        peri = cv2.arcLength(hull, True)
+        poly = cv2.approxPolyDP(hull, max(2.0, 0.015 * peri), True).reshape(-1, 2).astype(float)
+        n_pts = len(poly)
+
+        cv2.polylines(vis, [poly.astype(np.int32).reshape(-1, 1, 2)], True, edge_bgr, 2)
+
+        for j in range(n_pts):
+            p_prev = poly[(j - 1) % n_pts]
+            p_cur  = poly[j]
+            p_next = poly[(j + 1) % n_pts]
+            angle = _vertex_angle(p_prev, p_cur, p_next)
+            is_corner = abs(angle - 90.0) < angle_tol
+            dot_bgr = (0, 200, 0) if is_corner else (0, 0, 200)
+            cx, cy = int(p_cur[0]), int(p_cur[1])
+            cv2.circle(vis, (cx, cy), 6, dot_bgr, -1)
+            cv2.putText(vis, f"{angle:.0f}",
+                        (cx + 8, cy + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, dot_bgr, 1, cv2.LINE_AA)
+
+    return vis
+
+
+def debug_quads(region: np.ndarray,
+                sat_lo: int = 60, val_lo: int = 50) -> np.ndarray:
+    """
+    Returns an annotated BGR image showing every quad from get_quads.
+    Outline color = card color (full brightness if kept, dimmed if suppressed).
+    Label: "<color> <M1|M2|M3> [kept]" or "[IoU=X.XX]" / "[cov=X.XX]".
+    NMS mirrors get_card_images: color-aware, iou_thresh=0.40, min_coverage=0.15.
+    """
+    masks = preprocess_mask(region, sat_lo, val_lo)
+    combined = np.zeros(region.shape[:2], dtype=np.uint8)
+    for m, *_ in masks:
+        combined = cv2.bitwise_or(combined, m)
+    quads = get_quads(region, masks)
+    vis = region.copy()
+
+    entries = []  # (quad, color, method, pre_reason)
+    for quad, is_dark, color, method in quads:
+        cov = _quad_coverage(quad, combined)
+        if cov < 0.15:
+            entries.append((quad, color, method, f"cov={cov:.2f}"))
+            continue
+        img = _warp_card(region, quad, skip_tight_crop=is_dark)
+        entries.append((quad, color, method, "" if img is not None else "warp-fail"))
+
+    entries.sort(
+        key=lambda x: (x[0][:, 0].max() - x[0][:, 0].min()) *
+                      (x[0][:, 1].max() - x[0][:, 1].min()),
+        reverse=True,
+    )
+
+    kept_per_color: dict[str, list[np.ndarray]] = {}
+    decisions = []  # (quad, color, method, reason)
+    for quad, color, method, pre_reason in entries:
+        if pre_reason:
+            decisions.append((quad, color, method, pre_reason))
+            continue
+        reason = ""
+        for kq in kept_per_color.get(color, []):
+            iou = _bbox_iou(quad, kq)
+            if iou > 0.40:
+                reason = f"IoU={iou:.2f}"
+                break
+        if not reason:
+            kept_per_color.setdefault(color, []).append(quad)
+        decisions.append((quad, color, method, reason))
+
+    for quad, color, method, reason in decisions:
+        suppressed = bool(reason)
+        base_bgr = _CARD_COLOR_BGR.get(color, (128, 128, 128))
+        outline_bgr = tuple(int(c * 0.45) for c in base_bgr) if suppressed else base_bgr
+        thickness = 1 if suppressed else 2
+        cv2.polylines(vis, [quad.reshape(-1, 1, 2).astype(np.int32)], True, outline_bgr, thickness)
+        qcx = int(quad.mean(axis=0)[0])
+        qcy = int(quad.mean(axis=0)[1])
+        status = f"[{reason}]" if suppressed else "[kept]"
+        label = f"{color} {method} {status}"
+        cv2.putText(vis, label, (qcx - 40, qcy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, outline_bgr, 1, cv2.LINE_AA)
+
     return vis
