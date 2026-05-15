@@ -24,6 +24,13 @@ sys.path.insert(0, _HERE)
 
 from src.background_classification import classify_background
 from src.active_player_detection import detect_active_player
+from src.card_detection import detect_cards
+from src.card_classification import (classify_card, load_templates,
+                                      build_templates_from_labeled, save_templates)
+
+_LABELED_DIR   = os.path.join(_HERE, "labeled_cards")
+_TEMPLATES_DIR = os.path.join(_HERE, "templates")
+_SAT_LO, _VAL_LO = 80, 120
 
 
 def _load_rgb(path: str) -> np.ndarray:
@@ -34,26 +41,57 @@ def _load_rgb(path: str) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
+def _classify_region(region_bgr, templates: dict) -> str:
+    """Detect and classify all cards in a BGR region image. Returns 'EMPTY' if none."""
+    if region_bgr is None:
+        return "EMPTY"
+    cards = detect_cards(region_bgr, sat_lo=_SAT_LO, val_lo=_VAL_LO)
+    if not cards:
+        return "EMPTY"
+    return ";".join(classify_card(img, color, templates) for img, color in cards)
+
+
 def run(test_dir: str, output_path: str) -> None:
     image_ids = sorted(
         f[:-4] for f in os.listdir(test_dir) if f.lower().endswith(".jpg")
     )
     print(f"Found {len(image_ids)} test images in {test_dir!r}")
 
+    if os.path.isdir(_TEMPLATES_DIR) and any(f.endswith(".npy") for f in os.listdir(_TEMPLATES_DIR)):
+        templates = load_templates(_TEMPLATES_DIR)
+    else:
+        templates = build_templates_from_labeled(_LABELED_DIR)
+        save_templates(templates, _TEMPLATES_DIR)
+    print(f"Templates loaded: {sorted(templates.keys())}")
+
     rows = []
     for image_id in image_ids:
-        img = _load_rgb(os.path.join(test_dir, image_id + ".jpg"))
-        background = classify_background(img)
-        player = detect_active_player(img, background)
+        img_rgb = _load_rgb(os.path.join(test_dir, image_id + ".jpg"))
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+
+        background = classify_background(img_rgb)
+        player = detect_active_player(img_rgb, background)
+
+        # add remove background
+        # add split into regions
+
+        region_p1     = None  # TODO
+        region_p2     = None  # TODO
+        region_p3     = None  # TODO
+        region_p4     = None  # TODO
+        region_center = None  # TODO
+
         rows.append({
             "image_id":       image_id,
-            "center_card":    "EMPTY",
+            "center_card":    _classify_region(region_center, templates),
             "active_player":  player if player is not None else "EMPTY",
-            "player_1_cards": "EMPTY",
-            "player_2_cards": "EMPTY",
-            "player_3_cards": "EMPTY",
-            "player_4_cards": "EMPTY",
+            "player_1_cards": _classify_region(region_p1,     templates),
+            "player_2_cards": _classify_region(region_p2,     templates),
+            "player_3_cards": _classify_region(region_p3,     templates),
+            "player_4_cards": _classify_region(region_p4,     templates),
         })
+
+
 
     df = pd.DataFrame(rows, columns=[
         "image_id", "center_card", "active_player",

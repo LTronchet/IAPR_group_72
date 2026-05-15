@@ -556,11 +556,6 @@ def get_card_images(region: np.ndarray,
     # Dark cards use 2× tolerance — fragmented blobs make area estimates noisier.
     if ref_area > 0 and len(candidates) >= 2:
         def _area(q): return _quad_dimensions(q)[0] * _quad_dimensions(q)[1]
-        for c in candidates:
-            a = _area(c[0])
-            dev = abs(a - ref_area) / ref_area
-            kept_by_size = dev <= (size_tol * 2 if c[2] == "dark" else size_tol)
-            print(f"  [size] {c[2]:6s} {c[3]:3s} area={a:.0f}  dev={dev:.2f}  {'KEEP' if kept_by_size else 'DROP'}")
         candidates = [
             c for c in candidates
             if abs(_area(c[0]) - ref_area) / ref_area <= (size_tol * 2 if c[2] == "dark" else size_tol)

@@ -13,13 +13,14 @@ import cv2
 import matplotlib.pyplot as plt
 
 from src.card_detection import detect_cards, debug_mask
-from src.card_classification import classify_card, load_templates, save_templates
-from src.template_builder import build_templates
+from src.card_classification import (classify_card, load_templates,
+                                      save_templates, build_templates_from_labeled)
 
 DATA_DIR      = "iapr-26-uno-vision-challenge/train_images"
 CSV_PATH      = "iapr-26-uno-vision-challenge/train.csv"
 DEBUG_DIR     = "debug_output"
 TEMPLATES_DIR = "templates"
+LABELED_DIR   = "labeled_cards"
 
 SAT_LO = 80
 VAL_LO = 120
@@ -71,9 +72,10 @@ def _get_templates():
         templates = load_templates(TEMPLATES_DIR)
         print(f"Templates loaded from {TEMPLATES_DIR!r}: {sorted(templates.keys())}")
     else:
-        print("Building templates from training data (first run only)...")
-        templates = build_templates(CSV_PATH, DATA_DIR, sat_lo=SAT_LO, val_lo=VAL_LO)
+        print(f"Building templates from {LABELED_DIR!r}...")
+        templates = build_templates_from_labeled(LABELED_DIR)
         save_templates(templates, TEMPLATES_DIR)
+        print(f"Templates saved to {TEMPLATES_DIR!r}: {sorted(templates.keys())}")
     return templates
 
 
@@ -169,8 +171,138 @@ def run(image_id="L1000770"):
     return all_ok
 
 
+def _show_image_summary(image_id, results, templates):
+    region_order = ("p1", "p2", "p3", "p4", "center")
+    max_cards = max(len(cards) for _, cards, _, _ in results.values())
+    ncols = 2 + max(max_cards, 1)
+    nrows = len(region_order)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 4 * nrows))
+
+    for row_idx, name in enumerate(region_order):
+        region, cards, gt_labels, gt_count = results[name]
+        labels = [classify_card(c, col, templates) for c, col in cards]
+        n = len(labels)
+        axs = axes[row_idx]
+
+        if gt_count is not None:
+            count_ok = n == gt_count
+            label_ok = count_ok and sorted(labels) == sorted(gt_labels)
+            row_color = "green" if label_ok else "red"
+            if label_ok:
+                status = "OK"
+            elif not count_ok:
+                status = f"FAIL count (detected {n}, GT={gt_count})"
+            else:
+                status = f"FAIL labels"
+        else:
+            row_color = "black"
+            status = f"detected {n}  GT=?"
+
+        mask = debug_mask(region, name=name, sat_lo=SAT_LO, val_lo=VAL_LO)
+
+        axs[0].imshow(cv2.cvtColor(region, cv2.COLOR_BGR2RGB))
+        axs[0].set_title(f"{LABELS[name]}\n{status}", color=row_color, fontsize=9, fontweight="bold")
+        axs[0].axis("off")
+
+        axs[1].imshow(cv2.cvtColor(mask, cv2.COLOR_BGR2RGB))
+        axs[1].set_title("mask", fontsize=8)
+        axs[1].axis("off")
+
+        for col_idx in range(2, ncols):
+            card_idx = col_idx - 2
+            if card_idx < n:
+                card_img, _ = cards[card_idx]
+                axs[col_idx].imshow(cv2.cvtColor(card_img, cv2.COLOR_BGR2RGB))
+                axs[col_idx].set_title(labels[card_idx], fontsize=8)
+            else:
+                axs[col_idx].axis("off")
+            axs[col_idx].axis("off")
+
+    fig.suptitle(f"{image_id}  [sat_lo={SAT_LO}  val_lo={VAL_LO}]", fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+
+def run_all():
+    if not os.path.exists(CSV_PATH):
+        print(f"CSV not found: {CSV_PATH}")
+        return
+
+    with open(CSV_PATH, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    templates = _get_templates()
+
+    REGION_ORDER = ("p1", "p2", "p3", "p4", "center")
+    correct_count  = {r: 0 for r in REGION_ORDER}
+    correct_labels = {r: 0 for r in REGION_ORDER}
+    total          = {r: 0 for r in REGION_ORDER}
+    fails = []
+
+    for row in rows:
+        image_id = row["image_id"]
+        path = os.path.join(DATA_DIR, f"{image_id}.jpg")
+        img = cv2.imread(path)
+        if img is None:
+            print(f"  [SKIP] cannot load {path}")
+            continue
+        H, W = img.shape[:2]
+
+        img_ok = True
+        results = {}
+        for name in REGION_ORDER:
+            row_sl, col_sl = REGIONS[name](H, W)
+            region = img[row_sl, col_sl]
+            cards = detect_cards(region, sat_lo=SAT_LO, val_lo=VAL_LO)
+            gt_raw = row.get(CSV_KEYS[name], "")
+            gt_labels = [] if not gt_raw or gt_raw == "EMPTY" else gt_raw.split(";")
+            gt_count = len(gt_labels)
+            results[name] = (region, cards, gt_labels, gt_count)
+
+            total[name] += 1
+            n = len(cards)
+            if n == gt_count:
+                correct_count[name] += 1
+                pred = sorted(classify_card(c, col, templates) for c, col in cards)
+                if pred == sorted(gt_labels):
+                    correct_labels[name] += 1
+                else:
+                    img_ok = False
+                    fails.append((image_id, name, pred, gt_labels))
+            else:
+                img_ok = False
+                fails.append((image_id, name,
+                               [classify_card(c, col, templates) for c, col in cards],
+                               gt_labels))
+
+        status = "OK  " if img_ok else "FAIL"
+        print(f"[{status}] {image_id}")
+        if not img_ok:
+            _show_image_summary(image_id, results, templates)
+
+    print("\n--- Per-region accuracy (labels) ---")
+    all_cl = sum(correct_labels.values())
+    all_t  = sum(total.values())
+    for name in REGION_ORDER:
+        t  = total[name]
+        cc = correct_count[name]
+        cl = correct_labels[name]
+        pct = 100.0 * cl / t if t else float("nan")
+        print(f"  {LABELS[name]:22s}  count={cc:3d}/{t}  labels={cl:3d}/{t}  ({pct:.1f}%)")
+    pct_all = 100.0 * all_cl / all_t if all_t else float("nan")
+    print(f"  {'Overall':22s}  labels={all_cl:3d}/{all_t}  ({pct_all:.1f}%)")
+
+    if fails:
+        print(f"\n--- Failures ({len(fails)}) ---")
+        for image_id, name, pred, gt in sorted(fails):
+            print(f"  {image_id}  {LABELS[name]:22s}  pred={pred}  GT={gt}")
+
+
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    image_id = sys.argv[1] if len(sys.argv) > 1 else "L1000770"
-    ok = run(image_id)
-    print("\nAll counts match." if ok else "\nSome counts are wrong.")
+    if len(sys.argv) > 1:
+        ok = run(sys.argv[1])
+        print("\nAll counts match." if ok else "\nSome counts are wrong.")
+    else:
+        run_all()

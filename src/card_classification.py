@@ -52,6 +52,42 @@ def _extract_corner(card_img: np.ndarray, corner: str = 'TL') -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Template building from labeled_cards/
+# ---------------------------------------------------------------------------
+
+def build_templates_from_labeled(labeled_dir: str) -> dict[str, np.ndarray]:
+    """
+    Build one template per card value from the labeled_cards/ directory.
+
+    Expected layout:  labeled_dir/{value}/{any_name}.jpg
+    Each image must already be warped to CARD_WIDTH × CARD_HEIGHT
+    (as produced by detect_cards / label_cards.py).
+
+    Returns dict mapping value string → float32 mean white-mask.
+    """
+    from src.card_detection import CARD_WIDTH, CARD_HEIGHT
+
+    templates: dict[str, np.ndarray] = {}
+    for value in sorted(os.listdir(labeled_dir)):
+        val_path = os.path.join(labeled_dir, value)
+        if not os.path.isdir(val_path):
+            continue
+        patches: list[np.ndarray] = []
+        for fname in sorted(os.listdir(val_path)):
+            if not fname.lower().endswith('.jpg'):
+                continue
+            img = cv2.imread(os.path.join(val_path, fname))
+            if img is None:
+                continue
+            img = cv2.resize(img, (CARD_WIDTH, CARD_HEIGHT))
+            patches.append(_extract_corner(img, 'TL'))
+            patches.append(_extract_corner(img, 'BR'))
+        if patches:
+            templates[value] = np.mean(np.stack(patches), axis=0).astype(np.float32)
+    return templates
+
+
+# ---------------------------------------------------------------------------
 # Template persistence
 # ---------------------------------------------------------------------------
 
