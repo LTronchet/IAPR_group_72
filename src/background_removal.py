@@ -26,9 +26,7 @@ def resize_keep_ratio(img, max_dim=1600):
 # BACKGROUND REMOVAL
 # =========================================================
 
-def remove_background_grabcut(image_path, debug=False):
-
-    img = cv2.imread(str(image_path))
+def remove_background_grabcut(img, debug=False):
 
     if img is None:
         raise ValueError(f"Could not load image: {image_path}")
@@ -183,43 +181,3 @@ def remove_background_grabcut(image_path, debug=False):
         cv2.destroyAllWindows()
 
     return result
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-if __name__ == "__main__":
-
-    INPUT_DIR = Path("train_images")
-
-    OUTPUT_DIR = Path("outputs")
-
-    OUTPUT_DIR.mkdir(exist_ok=True)
-
-    image_paths = list(INPUT_DIR.glob("*"))
-
-    print(f"Found {len(image_paths)} images\n")
-
-    for image_path in image_paths:
-
-        print(f"Processing: {image_path.name}")
-
-        try:
-
-            result = remove_background_grabcut(
-                image_path,
-                debug=False
-            )
-
-            output_path = OUTPUT_DIR / image_path.name
-
-            cv2.imwrite(str(output_path), result)
-
-            print(f"Saved: {output_path}\n")
-
-        except Exception as e:
-
-            print(f"ERROR with {image_path.name}")
-            print(e)
-            print()
