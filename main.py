@@ -27,7 +27,7 @@ from src.active_player_detection import detect_active_player
 from src.card_detection import detect_cards
 from src.card_classification import (classify_card, load_templates,
                                       build_templates_from_labeled, save_templates)
-from src.background_removal import remove_background_grabcut, resize_keep_ratio
+from src.background_removal import remove_background, resize_keep_ratio
 
 _LABELED_DIR   = os.path.join(_HERE, "labeled_cards")
 _TEMPLATES_DIR = os.path.join(_HERE, "templates")
@@ -73,7 +73,7 @@ def run(test_dir: str, output_path: str) -> None:
         background = classify_background(img_rgb)
         player = detect_active_player(img_rgb, background)
 
-        clean_bgr = remove_background_grabcut(img_bgr)
+        clean_bgr = remove_background(img_bgr)
         # add split into regions
 
         region_p1     = None  # TODO

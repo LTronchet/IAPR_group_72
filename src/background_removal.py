@@ -1,183 +1,59 @@
 import cv2
 import numpy as np
 
-from pathlib import Path
+_SAT_HI   = 45    # HSV saturation upper bound  (white/light-gray has very low S)
+_VAL_LO   = 130   # HSV value lower bound        (shadowed white corners still bright)
+_MIN_AREA = 5000  # minimum contour area to keep (filters noise)
 
 
-# =========================================================
-# RESIZE KEEP RATIO
-# =========================================================
-
-def resize_keep_ratio(img, max_dim=1600):
-
+def resize_keep_ratio(img: np.ndarray, max_dim: int = 1600) -> np.ndarray:
     h, w = img.shape[:2]
-
     scale = max_dim / max(h, w)
-
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-
-    resized = cv2.resize(img, (new_w, new_h))
-
-    return resized
+    return cv2.resize(img, (int(w * scale), int(h * scale)))
 
 
-# =========================================================
-# BACKGROUND REMOVAL
-# =========================================================
+def _white_mask(img_bgr: np.ndarray) -> np.ndarray:
+    """HSV-based mask: pixels with low saturation and high value = white/light border."""
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    return cv2.inRange(hsv, (0, 0, _VAL_LO), (179, _SAT_HI, 255))
 
-def remove_background_grabcut(img, debug=False):
 
-    if img is None:
-        raise ValueError(f"Could not load image: {image_path}")
+def remove_background(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Remove the background from a UNO game image using HSV white-border detection.
 
-    img = resize_keep_ratio(img)
+    Detects card regions by their white border (low S, high V in HSV), fills each
+    card's interior, and sets all background pixels to white (255, 255, 255).
 
-    original = img.copy()
+    Returns a BGR image the same size as the input.
+    """
+    H, W = img_bgr.shape[:2]
 
-    h, w = img.shape[:2]
+    mask = _white_mask(img_bgr)
 
-    # =====================================================
-    # MASK
-    # =====================================================
+    # Small opening to remove noise before closing
+    ks_open = max(int(min(H, W) * 0.002) | 1, 8)
+    k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_open, ks_open))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
 
-    mask = np.zeros((h, w), np.uint8)
+    # Close to fill small gaps inside card borders
+    ks = max(int(min(H, W) * 0.005) | 1, 25)
+    k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+    mask_closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
 
-    bgdModel = np.zeros((1, 65), np.float64)
-    fgdModel = np.zeros((1, 65), np.float64)
+    # Keep only contours large enough to be card regions
+    contours, _ = cv2.findContours(mask_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = [c for c in contours if cv2.contourArea(c) >= _MIN_AREA]
 
-    # =====================================================
-    # FOREGROUND RECTANGLE
-    # =====================================================
+    # Fill each contour directly — no convex hull so overlapping cards stay separate
+    filled_mask = np.zeros((H, W), dtype=np.uint8)
+    cv2.drawContours(filled_mask, contours, -1, 255, cv2.FILLED)
 
-    margin_x = int(w * 0.02)
-    margin_y = int(h * 0.02)
+    # Opening on the filled mask to remove large background blobs that slipped through
+    ks_post = max(int(min(H, W) * 0.065) | 1, 21)
+    k_post  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks_post, ks_post))
+    filled_mask = cv2.morphologyEx(filled_mask, cv2.MORPH_OPEN, k_post)
 
-    rect = (
-        margin_x,
-        margin_y,
-        w - 2 * margin_x,
-        h - 2 * margin_y
-    )
-    #rect = (1, 1, w-2, h-2)
-
-    # =====================================================
-    # RUN GRABCUT
-    # =====================================================
-
-    cv2.grabCut(
-        img,
-        mask,
-        rect,
-        bgdModel,
-        fgdModel,
-        8,
-        cv2.GC_INIT_WITH_RECT
-    )
-
-    # =====================================================
-    # FINAL MASK
-    # =====================================================
-
-    final_mask = np.where(
-        (mask == 2) | (mask == 0),
-        0,
-        1
-    ).astype("uint8")
-
-    # Smooth cleanup
-    kernel = np.ones((7, 7), np.uint8)
-
-    # Fill small holes inside cards
-    final_mask = cv2.morphologyEx(
-        final_mask,
-        cv2.MORPH_CLOSE,
-        kernel,
-        iterations=2
-    )
-
-    # Remove tiny noise
-    final_mask = cv2.morphologyEx(
-        final_mask,
-        cv2.MORPH_OPEN,
-        kernel,
-        iterations=1
-    )
-
-    # Remove tiny connected components
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        final_mask,
-        connectivity=8
-    )
-
-    clean_mask = np.zeros_like(final_mask)
-
-    clean_mask = cv2.GaussianBlur(
-        clean_mask.astype(np.float32),
-        (5,5),
-        0
-    )
-
-    clean_mask = (clean_mask > 0.5).astype("uint8")
-
-    MIN_AREA = 10000
-
-    for i in range(1, num_labels):
-
-        area = stats[i, cv2.CC_STAT_AREA]
-
-        if area > MIN_AREA:
-
-            clean_mask[labels == i] = 1
-
-    final_mask = clean_mask
-
-    # Shrink mask slightly to remove border artifacts
-
-    kernel_erode = np.ones((3,3), np.uint8)
-
-    final_mask = cv2.erode(
-        final_mask,
-        kernel_erode,
-        iterations=1
-    )
-
-    # =====================================================
-    # MORPHOLOGICAL CLEANUP
-    # =====================================================
-
-    kernel = np.ones((5, 5), np.uint8)
-
-    final_mask = cv2.morphologyEx(
-        final_mask,
-        cv2.MORPH_CLOSE,
-        kernel
-    )
-
-    # =====================================================
-    # APPLY MASK
-    # =====================================================
-
-    result = original.copy()
-
-    result[final_mask == 0] = [255, 255, 255]
-
-    # =====================================================
-    # DEBUG
-    # =====================================================
-
-    if debug:
-
-        cv2.namedWindow("Original", cv2.WINDOW_NORMAL)
-        cv2.namedWindow("Mask", cv2.WINDOW_NORMAL)
-        cv2.namedWindow("Result", cv2.WINDOW_NORMAL)
-
-        cv2.imshow("Original", original)
-        cv2.imshow("Mask", final_mask * 255)
-        cv2.imshow("Result", result)
-
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-
+    result = np.full_like(img_bgr, 255)
+    result[filled_mask == 255] = img_bgr[filled_mask == 255]
     return result
