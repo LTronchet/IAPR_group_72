@@ -42,8 +42,8 @@ def _load_rgb(path: str) -> np.ndarray:
         raise FileNotFoundError(f"Could not read image: {path}")
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-
-def _classify_region(region_bgr, templates: dict) -> str:
+"""Previous version"""
+def _classify_region_v1(region_bgr, templates: dict) -> str:
     """Detect and classify all cards in a BGR region image. Returns 'EMPTY' if none."""
     if region_bgr is None:
         return "EMPTY"
@@ -51,6 +51,38 @@ def _classify_region(region_bgr, templates: dict) -> str:
     if not cards:
         return "EMPTY"
     return ";".join(classify_card(img, color, templates) for img, color in cards)
+
+
+"""New version"""
+def _classify_region(region_bgr, templates: dict) -> str:
+    """
+    Detect and classify all cards in one or multiple region images.
+    Returns 'EMPTY' if none.
+    """
+    if region_bgr is None:
+        return "EMPTY"
+
+    if not isinstance(region_bgr, list):
+        region_bgr = [region_bgr]
+    results = []
+    for crop in region_bgr:
+        if crop is None:
+            continue
+        cards = detect_cards(
+            crop,
+            sat_lo=_SAT_LO,
+            val_lo=_VAL_LO
+        )
+        if not cards:
+            continue
+        classifications = [
+            classify_card(img, color, templates)
+            for img, color in cards
+        ]
+        results.extend(classifications)
+    if not results:
+        return "EMPTY"
+    return ";".join(results)
 
 
 def run(test_dir: str, output_path: str) -> None:
