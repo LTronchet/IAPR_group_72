@@ -28,6 +28,7 @@ from src.card_detection import detect_cards
 from src.card_classification import (classify_card, load_templates,
                                       build_templates_from_labeled, save_templates)
 from src.background_removal import remove_background, resize_keep_ratio
+from src.split_regions import extract_cluster_crops
 
 _LABELED_DIR   = os.path.join(_HERE, "labeled_cards")
 _TEMPLATES_DIR = os.path.join(_HERE, "templates")
@@ -74,13 +75,13 @@ def run(test_dir: str, output_path: str) -> None:
         player = detect_active_player(img_rgb, background)
 
         clean_bgr = remove_background(img_bgr)
-        # add split into regions
+        regions = extract_cluster_crops(clean_bgr)
 
-        region_p1     = None  # TODO
-        region_p2     = None  # TODO
-        region_p3     = None  # TODO
-        region_p4     = None  # TODO
-        region_center = None  # TODO
+        region_p1     = [ obj["image"] for obj in regions.values() if obj["region"] == "p1" ]
+        region_p2     = [ obj["image"] for obj in regions.values() if obj["region"] == "p2" ]
+        region_p3     = [ obj["image"] for obj in regions.values() if obj["region"] == "p3" ]
+        region_p4     = [ obj["image"] for obj in regions.values() if obj["region"] == "p4" ]
+        region_center = [ obj["image"] for obj in regions.values() if obj["region"] == "center" ]
 
         rows.append({
             "image_id":       image_id,
