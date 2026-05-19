@@ -27,62 +27,35 @@ from src.active_player_detection import detect_active_player
 from src.card_detection import detect_cards
 from src.card_classification import (classify_card, load_templates,
                                       build_templates_from_labeled, save_templates)
-from src.background_removal import remove_background, resize_keep_ratio
-from src.split_regions import extract_cluster_crops
+from src.background_removal import remove_background
 
 _LABELED_DIR   = os.path.join(_HERE, "labeled_cards")
 _TEMPLATES_DIR = os.path.join(_HERE, "templates")
 _SAT_LO, _VAL_LO = 80, 120
 
+# Fixed-grid region crops (mirrors test_card_classification.py)
+_REGIONS = {
+    "p3":     lambda H, W: (slice(0,          H // 3),     slice(W // 4,     3 * W // 4)),
+    "p4":     lambda H, W: (slice(H // 4,     3 * H // 4), slice(0,          W // 4)),
+    "p2":     lambda H, W: (slice(H // 4,     3 * H // 4), slice(3 * W // 4, W)),
+    "p1":     lambda H, W: (slice(2 * H // 3, H),          slice(W // 4,     3 * W // 4)),
+    "center": lambda H, W: (slice(H // 3,     2 * H // 3), slice(W // 3,     2 * W // 3)),
+}
 
-def _load_rgb(path: str) -> np.ndarray:
-    """Load an image from disk as an RGB numpy array."""
+
+def _load_bgr(path: str) -> np.ndarray:
     img = cv2.imread(path)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {path}")
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img
 
-"""Previous version"""
-def _classify_region_v1(region_bgr, templates: dict) -> str:
-    """Detect and classify all cards in a BGR region image. Returns 'EMPTY' if none."""
-    if region_bgr is None:
-        return "EMPTY"
+
+def _classify_region(region_bgr: np.ndarray, templates: dict) -> str:
+    """Detect and classify all cards in a BGR region. Returns 'EMPTY' if none."""
     cards = detect_cards(region_bgr, sat_lo=_SAT_LO, val_lo=_VAL_LO)
     if not cards:
         return "EMPTY"
     return ";".join(classify_card(img, color, templates) for img, color in cards)
-
-
-"""New version"""
-def _classify_region(region_bgr, templates: dict) -> str:
-    """
-    Detect and classify all cards in one or multiple region images.
-    Returns 'EMPTY' if none.
-    """
-    if region_bgr is None:
-        return "EMPTY"
-
-    if not isinstance(region_bgr, list):
-        region_bgr = [region_bgr]
-    results = []
-    for crop in region_bgr:
-        if crop is None:
-            continue
-        cards = detect_cards(
-            crop,
-            sat_lo=_SAT_LO,
-            val_lo=_VAL_LO
-        )
-        if not cards:
-            continue
-        classifications = [
-            classify_card(img, color, templates)
-            for img, color in cards
-        ]
-        results.extend(classifications)
-    if not results:
-        return "EMPTY"
-    return ";".join(results)
 
 
 def run(test_dir: str, output_path: str) -> None:
@@ -100,32 +73,30 @@ def run(test_dir: str, output_path: str) -> None:
 
     rows = []
     for image_id in image_ids:
-        img_rgb = _load_rgb(os.path.join(test_dir, image_id + ".jpg"))
-        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        img_bgr = _load_bgr(os.path.join(test_dir, image_id + ".jpg"))
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         background = classify_background(img_rgb)
         player = detect_active_player(img_rgb, background)
 
         clean_bgr = remove_background(img_bgr)
-        regions = extract_cluster_crops(clean_bgr)
+        H, W = clean_bgr.shape[:2]
 
-        region_p1     = [ obj["image"] for obj in regions.values() if obj["region"] == "p1" ]
-        region_p2     = [ obj["image"] for obj in regions.values() if obj["region"] == "p2" ]
-        region_p3     = [ obj["image"] for obj in regions.values() if obj["region"] == "p3" ]
-        region_p4     = [ obj["image"] for obj in regions.values() if obj["region"] == "p4" ]
-        region_center = [ obj["image"] for obj in regions.values() if obj["region"] == "center" ]
+        regions = {
+            name: clean_bgr[row_sl, col_sl]
+            for name, crop_fn in _REGIONS.items()
+            for row_sl, col_sl in [crop_fn(H, W)]
+        }
 
         rows.append({
             "image_id":       image_id,
-            "center_card":    _classify_region(region_center, templates),
+            "center_card":    _classify_region(regions["center"], templates),
             "active_player":  player if player is not None else "EMPTY",
-            "player_1_cards": _classify_region(region_p1,     templates),
-            "player_2_cards": _classify_region(region_p2,     templates),
-            "player_3_cards": _classify_region(region_p3,     templates),
-            "player_4_cards": _classify_region(region_p4,     templates),
+            "player_1_cards": _classify_region(regions["p1"],     templates),
+            "player_2_cards": _classify_region(regions["p2"],     templates),
+            "player_3_cards": _classify_region(regions["p3"],     templates),
+            "player_4_cards": _classify_region(regions["p4"],     templates),
         })
-
-
 
     df = pd.DataFrame(rows, columns=[
         "image_id", "center_card", "active_player",
