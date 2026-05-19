@@ -67,7 +67,7 @@ def run(image_id: str = "L1000988") -> None:
     axes[1].axis("off")
 
     axes[2].imshow(filled_mask, cmap="gray")
-    axes[2].set_title(f"Filled cards ({len(contours)})")
+    axes[2].set_title(f"After morphological operations ({len(contours)})")
     axes[2].axis("off")
 
     axes[3].imshow(cv2.cvtColor(img_masked, cv2.COLOR_BGR2RGB))

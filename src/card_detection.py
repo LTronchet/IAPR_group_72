@@ -803,8 +803,11 @@ def debug_quads(region: np.ndarray,
         suppressed = bool(reason)
         base_bgr = _CARD_COLOR_BGR.get(color, (128, 128, 128))
         outline_bgr = tuple(int(c * 0.45) for c in base_bgr) if suppressed else base_bgr
-        thickness = 1 if suppressed else 2
-        cv2.polylines(vis, [quad.reshape(-1, 1, 2).astype(np.int32)], True, outline_bgr, thickness)
+        thickness = 2 if suppressed else 4
+        pts = quad.reshape(-1, 1, 2).astype(np.int32)
+        if not suppressed:
+            cv2.polylines(vis, [pts], True, (255, 255, 255), thickness + 4)  # white border
+        cv2.polylines(vis, [pts], True, outline_bgr, thickness)
         qcx = int(quad.mean(axis=0)[0])
         qcy = int(quad.mean(axis=0)[1])
         status = f"[{reason}]" if suppressed else "[kept]"
