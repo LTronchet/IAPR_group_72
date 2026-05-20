@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from src.card_detection import detect_cards, debug_mask
 from src.card_classification import (classify_card, load_templates,
                                       save_templates, build_templates_from_labeled)
+from src.background_removal import remove_background
 
 DATA_DIR      = "iapr-26-uno-vision-challenge/train_images"
 CSV_PATH      = "iapr-26-uno-vision-challenge/train.csv"
@@ -129,6 +130,7 @@ def run(image_id="L1000770"):
     path = os.path.join(DATA_DIR, f"{image_id}.jpg")
     img = cv2.imread(path)
     assert img is not None, f"Cannot load {path}"
+    # img = remove_background(img)
     H, W = img.shape[:2]
 
     templates = _get_templates()
@@ -247,6 +249,7 @@ def run_all():
         if img is None:
             print(f"  [SKIP] cannot load {path}")
             continue
+        # img = remove_background(img)
         H, W = img.shape[:2]
 
         img_ok = True

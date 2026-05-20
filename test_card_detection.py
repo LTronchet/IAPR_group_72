@@ -14,6 +14,7 @@ import cv2
 import matplotlib.pyplot as plt
 
 from src.card_detection import detect_cards, debug_mask, debug_orphan_angles, debug_quads
+from src.background_removal import remove_background
 
 DATA_DIR  = "iapr-26-uno-vision-challenge/train_images"
 CSV_PATH  = "iapr-26-uno-vision-challenge/train.csv"
@@ -197,6 +198,7 @@ def run(image_id="L1000770"):
     path = os.path.join(DATA_DIR, f"{image_id}.jpg")
     img = cv2.imread(path)
     assert img is not None, f"Cannot load {path}"
+    img = remove_background(img)
     H, W = img.shape[:2]
 
     gt = _load_gt(image_id)
@@ -265,6 +267,7 @@ def run_all():
         if img is None:
             print(f"  [SKIP] cannot load {path}")
             continue
+        img = remove_background(img)
         H, W = img.shape[:2]
 
         img_ok = True
